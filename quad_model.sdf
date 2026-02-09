@@ -1,0 +1,190 @@
+<?xml version="1.0" ?>
+<sdf version="1.9">
+  <model name="quad">
+    <pose>0 0 1 0 0 0</pose>
+
+    <!-- Main body -->
+    <link name="base_link">
+      <inertial>
+        <mass>1.2</mass>
+        <inertia>
+          <ixx>0.02</ixx><iyy>0.02</iyy><izz>0.04</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+
+      <collision name="body_collision">
+        <geometry><box><size>0.30 0.30 0.10</size></box></geometry>
+      </collision>
+      <visual name="body_visual">
+        <geometry><box><size>0.20 0.20 0.05</size></box></geometry>
+        <material>
+          <ambient>0.05 0.01 0.01 0.08</ambient>
+          <diffuse>0.1 0.1 0.1 1</diffuse>
+          <specular>0.2 0.2 0.2 1</specular>
+        </material>
+      </visual>
+
+      <!-- X-frame arms -->
+      <visual name="arm_1">
+        <pose>0 0 0 0 0 0.785398</pose>
+        <geometry><box><size>0.55 0.04 0.02</size></box></geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+          <specular>0.2 0.2 0.2 1</specular>
+        </material>
+      </visual>
+      <visual name="arm_2">
+        <pose>0 0 0 0 0 -0.785398</pose>
+        <geometry><box><size>0.55 0.04 0.02</size></box></geometry>
+        <material>
+          <ambient>0.2 0.2 0.2 1</ambient>
+          <diffuse>0.2 0.2 0.2 1</diffuse>
+          <specular>0.2 0.2 0.2 1</specular>
+        </material>
+      </visual>
+    </link>
+
+    <!-- Rotor links (very simple visuals) -->
+    <link name="rotor_0">
+      <pose> 0.18  0.18 0.06 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>1e-5</ixx><iyy>1e-5</iyy><izz>2e-5</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <visual name="v">
+        <geometry><cylinder><radius>0.06</radius><length>0.01</length></cylinder></geometry>
+      </visual>
+    </link>
+    <link name="rotor_1">
+      <pose>-0.18  0.18 0.06 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>1e-5</ixx><iyy>1e-5</iyy><izz>2e-5</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <visual name="v">
+        <geometry><cylinder><radius>0.06</radius><length>0.01</length></cylinder></geometry>
+      </visual>
+    </link>
+    <link name="rotor_2">
+      <pose>-0.18 -0.18 0.06 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>1e-5</ixx><iyy>1e-5</iyy><izz>2e-5</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <visual name="v">
+        <geometry><cylinder><radius>0.06</radius><length>0.01</length></cylinder></geometry>
+      </visual>
+    </link>
+    <link name="rotor_3">
+      <pose> 0.18 -0.18 0.06 0 0 0</pose>
+      <inertial>
+        <mass>0.01</mass>
+        <inertia>
+          <ixx>1e-5</ixx><iyy>1e-5</iyy><izz>2e-5</izz>
+          <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+        </inertia>
+      </inertial>
+      <visual name="v">
+        <geometry><cylinder><radius>0.06</radius><length>0.01</length></cylinder></geometry>
+      </visual>
+    </link>
+
+    <!-- Rotor spin joints -->
+    <joint name="rotor_0_joint" type="revolute">
+      <parent>base_link</parent><child>rotor_0</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+    <joint name="rotor_1_joint" type="revolute">
+      <parent>base_link</parent><child>rotor_1</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+    <joint name="rotor_2_joint" type="revolute">
+      <parent>base_link</parent><child>rotor_2</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+    <joint name="rotor_3_joint" type="revolute">
+      <parent>base_link</parent><child>rotor_3</child>
+      <axis><xyz>0 0 1</xyz></axis>
+    </joint>
+
+    <!-- Motor model on EACH rotor -->
+    <plugin filename="gz-sim-multicopter-motor-model-system"
+            name="gz::sim::systems::MulticopterMotorModel">
+      <jointName>rotor_0_joint</jointName>
+      <linkName>rotor_0</linkName>
+      <commandSubTopic>/quad/gazebo/command/motor_speed</commandSubTopic>
+      <turningDirection>ccw</turningDirection>
+      <motorConstant>8.54858e-06</motorConstant>
+      <momentConstant>1.6e-02</momentConstant>
+      <actuator_number>0</actuator_number>
+    </plugin>
+
+    <plugin filename="gz-sim-multicopter-motor-model-system"
+            name="gz::sim::systems::MulticopterMotorModel">
+      <jointName>rotor_1_joint</jointName>
+      <linkName>rotor_1</linkName>
+      <commandSubTopic>/quad/gazebo/command/motor_speed</commandSubTopic>
+      <turningDirection>cw</turningDirection>
+      <motorConstant>8.54858e-06</motorConstant>
+      <momentConstant>1.6e-02</momentConstant>
+      <actuator_number>1</actuator_number>
+    </plugin>
+
+    <plugin filename="gz-sim-multicopter-motor-model-system"
+            name="gz::sim::systems::MulticopterMotorModel">
+      <jointName>rotor_2_joint</jointName>
+      <linkName>rotor_2</linkName>
+      <commandSubTopic>/quad/gazebo/command/motor_speed</commandSubTopic>
+      <turningDirection>ccw</turningDirection>
+      <motorConstant>8.54858e-06</motorConstant>
+      <momentConstant>1.6e-02</momentConstant>
+      <actuator_number>2</actuator_number>
+    </plugin>
+
+    <plugin filename="gz-sim-multicopter-motor-model-system"
+            name="gz::sim::systems::MulticopterMotorModel">
+      <jointName>rotor_3_joint</jointName>
+      <linkName>rotor_3</linkName>
+      <commandSubTopic>/quad/gazebo/command/motor_speed</commandSubTopic>
+      <turningDirection>cw</turningDirection>
+      <motorConstant>8.54858e-06</motorConstant>
+      <momentConstant>1.6e-02</momentConstant>
+      <actuator_number>3</actuator_number>
+    </plugin>
+
+    <!-- Velocity controller: explicit topics to match random_policy.py -->
+    <plugin filename="gz-sim-multicopter-control-system"
+            name="gz::sim::systems::MulticopterVelocityControl">
+      <robotNamespace>quad</robotNamespace>
+      <commandSubTopic>gazebo/command/twist</commandSubTopic>
+      <enableSubTopic>enable</enableSubTopic>
+      <comLinkName>base_link</comLinkName>
+
+      <!-- Gains: conservative starter values -->
+      <velocityGain>4 4 6</velocityGain>
+      <attitudeGain>4 4 1</attitudeGain>
+      <angularRateGain>0.3 0.3 0.2</angularRateGain>
+
+      <!-- Optional safety caps -->
+      <maxLinearAcceleration>6 6 8</maxLinearAcceleration>
+
+      <rotorConfiguration>
+        <rotor><jointName>rotor_0_joint</jointName><forceConstant>8.54858e-06</forceConstant><momentConstant>1.6e-02</momentConstant><direction> 1</direction></rotor>
+        <rotor><jointName>rotor_1_joint</jointName><forceConstant>8.54858e-06</forceConstant><momentConstant>1.6e-02</momentConstant><direction>-1</direction></rotor>
+        <rotor><jointName>rotor_2_joint</jointName><forceConstant>8.54858e-06</forceConstant><momentConstant>1.6e-02</momentConstant><direction> 1</direction></rotor>
+        <rotor><jointName>rotor_3_joint</jointName><forceConstant>8.54858e-06</forceConstant><momentConstant>1.6e-02</momentConstant><direction>-1</direction></rotor>
+      </rotorConfiguration>
+    </plugin>
+  </model>
+</sdf>
