@@ -6,8 +6,7 @@ This repository now includes a project website:
 - `index.html`
 - `styles.css`
 - `videos/` (place random-agent videos here)
-Website Link:
-`https://leos-bit.github.io/Intro-to-Robot-Learning-/`
+- Website Link: `https://leos-bit.github.io/Intro-to-Robot-Learning-/`
 
 ### Add random-agent videos
 Put MP4 files in `videos/` using these names:
