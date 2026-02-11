@@ -1,0 +1,157 @@
+:root {
+  --bg: #f4f6f8;
+  --surface: #ffffff;
+  --text: #1f2933;
+  --muted: #52606d;
+  --accent: #0f766e;
+  --accent-2: #164e63;
+  --border: #d9e2ec;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  font-family: "Avenir Next", "Segoe UI", sans-serif;
+  color: var(--text);
+  background: linear-gradient(180deg, #ecf2f6 0%, var(--bg) 100%);
+  line-height: 1.5;
+}
+
+.container {
+  width: min(1080px, 92vw);
+  margin: 0 auto;
+}
+
+.hero {
+  background: linear-gradient(135deg, var(--accent-2), #0b4f6c 55%, var(--accent));
+  color: #fff;
+  padding: 3.5rem 0 2.5rem;
+}
+
+.eyebrow {
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  font-size: 0.78rem;
+  margin: 0 0 0.75rem;
+  opacity: 0.9;
+}
+
+h1 {
+  margin: 0;
+  font-size: clamp(1.8rem, 3.2vw, 2.8rem);
+  line-height: 1.12;
+}
+
+.subtitle {
+  margin-top: 0.9rem;
+  max-width: 760px;
+  color: #dce8ef;
+}
+
+.hero-nav {
+  display: flex;
+  gap: 0.75rem;
+  flex-wrap: wrap;
+  margin-top: 1.25rem;
+}
+
+.hero-nav a {
+  color: #fff;
+  text-decoration: none;
+  border: 1px solid rgba(255, 255, 255, 0.35);
+  border-radius: 999px;
+  padding: 0.38rem 0.85rem;
+  font-size: 0.9rem;
+}
+
+.section {
+  padding: 2.2rem 0;
+}
+
+.section.alt {
+  background: #eef3f6;
+  border-top: 1px solid var(--border);
+  border-bottom: 1px solid var(--border);
+}
+
+.grid-two {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.card {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 1rem 1.1rem;
+  box-shadow: 0 4px 18px rgba(16, 24, 40, 0.05);
+}
+
+h2 {
+  margin-top: 0;
+  margin-bottom: 0.55rem;
+}
+
+h3 {
+  margin-top: 0;
+  margin-bottom: 0.5rem;
+}
+
+ul {
+  margin: 0.6rem 0 0;
+  padding-left: 1.1rem;
+}
+
+.figure-card img {
+  width: 100%;
+  height: auto;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+}
+
+.video-grid {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 1rem;
+}
+
+.video-card video {
+  width: 100%;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #111;
+}
+
+.muted {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+pre {
+  margin: 0.5rem 0 0;
+  padding: 0.85rem;
+  border-radius: 8px;
+  background: #0f172a;
+  color: #e2e8f0;
+  overflow-x: auto;
+}
+
+.footer {
+  padding: 1.2rem 0 2.2rem;
+  color: var(--muted);
+  text-align: center;
+}
+
+@media (max-width: 900px) {
+  .grid-two {
+    grid-template-columns: 1fr;
+  }
+
+  .video-grid {
+    grid-template-columns: 1fr;
+  }
+}

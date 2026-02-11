@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Intro to Robot Learning Project</title>
+  <meta name="description" content="Drone pathing with reinforcement learning in Gazebo, including random-agent baseline videos and results.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+  <header class="hero">
+    <div class="container">
+      <p class="eyebrow">CMU Intro to Robot Learning</p>
+      <h1>Drone Pathing using Reinforcement Learning</h1>
+      <p class="subtitle">
+        Gazebo-based quadrotor navigation with disturbance robustness, random-agent baselines, and RL training comparisons.
+      </p>
+      <nav class="hero-nav" aria-label="Primary">
+        <a href="#overview">Overview</a>
+        <a href="#results">Results</a>
+        <a href="#videos">Random Agent Videos</a>
+        <a href="#repro">Reproducibility</a>
+      </nav>
+    </div>
+  </header>
+
+  <main>
+    <section id="overview" class="section">
+      <div class="container grid-two">
+        <article class="card">
+          <h2>Project Overview</h2>
+          <p>
+            This project studies robust drone navigation in cluttered environments under wind disturbances.
+            The agent must reach a goal while avoiding collisions and controlling effort.
+          </p>
+          <ul>
+            <li>Simulator: Gazebo Sim</li>
+            <li>Platform: Quadrotor model in SDF</li>
+            <li>Baseline: Random policy</li>
+            <li>Evaluation: Return, collisions, success rate</li>
+          </ul>
+        </article>
+        <article class="card">
+          <h2>Environment Setup</h2>
+          <p>Key files currently used in this repository:</p>
+          <ul>
+            <li><code>quad_world.sdf</code> - world configuration</li>
+            <li><code>quad_model.sdf</code> - quadrotor model and plugins</li>
+            <li><code>random_policy.py</code> - random action baseline</li>
+          </ul>
+        </article>
+      </div>
+    </section>
+
+    <section id="results" class="section alt">
+      <div class="container">
+        <h2>Initial Results</h2>
+        <p>
+          Replace this section with your actual return-vs-environment-steps figure and summary once training runs complete.
+        </p>
+        <figure class="card figure-card">
+          <img src="res_graph.png" alt="Return versus environment steps graph">
+          <figcaption>Current result snapshot from the repository.</figcaption>
+        </figure>
+      </div>
+    </section>
+
+    <section id="videos" class="section">
+      <div class="container">
+        <h2>Random Agent Performance Videos</h2>
+        <p>
+          Place your baseline rollout videos in the <code>videos/</code> folder and update the file names below.
+        </p>
+        <div class="video-grid">
+          <article class="card video-card">
+            <h3>Random Agent Run 1</h3>
+            <video controls preload="metadata" aria-label="Random Agent Run 1">
+              <source src="videos/random_run_01.mp4" type="video/mp4">
+              Your browser does not support embedded video.
+            </video>
+            <p class="muted">Expected file: <code>videos/random_run_01.mp4</code></p>
+          </article>
+          <article class="card video-card">
+            <h3>Random Agent Run 2</h3>
+            <video controls preload="metadata" aria-label="Random Agent Run 2">
+              <source src="videos/random_run_02.mp4" type="video/mp4">
+              Your browser does not support embedded video.
+            </video>
+            <p class="muted">Expected file: <code>videos/random_run_02.mp4</code></p>
+          </article>
+          <article class="card video-card">
+            <h3>Random Agent Run 3</h3>
+            <video controls preload="metadata" aria-label="Random Agent Run 3">
+              <source src="videos/random_run_03.mp4" type="video/mp4">
+              Your browser does not support embedded video.
+            </video>
+            <p class="muted">Expected file: <code>videos/random_run_03.mp4</code></p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <section id="repro" class="section alt">
+      <div class="container">
+        <h2>Reproducibility</h2>
+        <div class="card">
+          <p>Minimal startup flow on macOS:</p>
+          <pre><code>gz sim -s quad_world.sdf
+gz sim -g
+conda activate gz-ws
+python3 random_policy.py</code></pre>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    <div class="container">
+      <p>Intro to Robot Learning Project • Leo Shaw</p>
+    </div>
+  </footer>
+</body>
+</html>
