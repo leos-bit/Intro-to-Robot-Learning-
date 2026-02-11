@@ -45,6 +45,13 @@ h1 {
   line-height: 1.12;
 }
 
+.authors {
+  margin: 0.55rem 0 0;
+  color: #dce8ef;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+}
+
 .subtitle {
   margin-top: 0.9rem;
   max-width: 760px;
