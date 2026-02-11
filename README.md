@@ -6,18 +6,7 @@ This repository now includes a project website:
 - `index.html`
 - `styles.css`
 - `videos/` (place random-agent videos here)
-
-### Publish on GitHub Pages
-1. Push this repository to `main`.
-2. Open repository settings on GitHub.
-3. Go to `Pages`.
-4. Set:
-   - Source: `Deploy from a branch`
-   - Branch: `main`
-   - Folder: `/ (root)`
-5. Save and wait for deployment.
-
-Your site URL will be:
+Website Link:
 `https://leos-bit.github.io/Intro-to-Robot-Learning-/`
 
 ### Add random-agent videos
