@@ -1,0 +1,38 @@
+Metadata-Version: 2.4
+Name: drone-training
+Version: 0.1.0
+Summary: MuJoCo drone RL environments and training utilities
+Requires-Python: >=3.10
+Description-Content-Type: text/markdown
+Requires-Dist: gymnasium>=0.29
+Requires-Dist: numpy>=1.24
+Requires-Dist: mujoco>=3.1
+
+# drone-training
+
+Local package for MuJoCo drone environments.
+
+## Install (editable)
+
+```bash
+pip install -e .
+```
+
+## Quick check
+
+```python
+import gymnasium as gym
+import drone_training  # triggers env registration
+
+env = gym.make(
+    "DroneEnv-v0",
+    model_path="Drone_MJCFs/skydio_x2/scene.xml",
+    dt=0.01,
+    max_steps=200,
+    render_mode=None,
+    xylim=2.0,
+    zlim=2.0,
+    vellim=1.0,
+    yawrate_lim=1.0,
+)
+```

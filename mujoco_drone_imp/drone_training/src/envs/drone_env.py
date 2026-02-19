@@ -2,6 +2,7 @@ from typing import Optional
 import numpy as np
 import gymnasium as gym
 import mujoco as mj
+
 class Drone_Env(gym.Env):
     
     def __init__(self, model_path, dt, max_steps, render_mode, xylim, zlim, vellim, yawrate_lim):
@@ -222,7 +223,11 @@ class Drone_Env(gym.Env):
 
 
 if __name__ == "__main__":
-    env = Drone_Env(
+    import drone_training
+
+
+    env = gym.make(
+    "DroneEnv-v0",
     model_path="Drone_MJCFs/skydio_x2/scene.xml",
     dt=0.01,
     max_steps=200,

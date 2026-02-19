@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "drone-training"
+version = "0.1.0"
+description = "MuJoCo drone RL environments and training utilities"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "gymnasium>=0.29",
+  "numpy>=1.24",
+  "mujoco>=3.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["drone_training*"]
+exclude = ["tests*"]
