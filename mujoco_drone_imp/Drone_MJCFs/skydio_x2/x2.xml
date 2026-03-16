@@ -49,6 +49,26 @@
       <site name="thrust2" pos="-.14 .18 .05"/>
       <site name="thrust3" pos=".14 .18 .08"/>
       <site name="thrust4" pos=".14 -.18 .08"/>
+      <site name="lidar_front" pos="0 0 0.03" zaxis="1 0 0"/>
+      <site name="lidar_left"  pos="0 0 0.03" zaxis="0 1 0"/>
+      <site name="lidar_back"  pos="0 0 0.03" zaxis="-1 0 0"/>
+      <site name="lidar_right" pos="0 0 0.03" zaxis="0 -1 0"/>
+      <site name="lidar_up"    pos="0 0 0.03" zaxis="0 0 1"/>
+      <site name="lidar_down"  pos="0 0 0.03" zaxis="0 0 -1"/>
+      <site name="lidar_front_left"  pos="0 0 0.03" zaxis="1 1 0"/>
+      <site name="lidar_front_right"  pos="0 0 0.03" zaxis="1 -1 0"/>
+      <site name="lidar_back_left"  pos="0 0 0.03" zaxis="-1 1 0"/>
+      <site name="lidar_back_right"  pos="0 0 0.03" zaxis="-1 -1 0"/>
+      <site name="lidar_up_left"    pos="0 0 0.03" zaxis="0 1 1"/>
+      <site name="lidar_up_right"    pos="0 0 0.03" zaxis="0 -1 1"/>
+      <site name="lidar_up_front"    pos="0 0 0.03" zaxis="1 0 1"/>
+      <site name="lidar_up_back"    pos="0 0 0.03" zaxis="-1 0 1"/>
+      <site name="lidar_down_left"  pos="0 0 0.03" zaxis="0 1 -1"/>
+      <site name="lidar_down_right"  pos="0 0 0.03" zaxis="0 -1 -1"/>
+      <site name="lidar_down_front"  pos="0 0 0.03" zaxis="1 0 -1"/>
+      <site name="lidar_down_back"  pos="0 0 0.03" zaxis="-1 0 -1"/>
+      
+
     </body>
   </worldbody>
 
@@ -63,6 +83,24 @@
     <gyro name="body_gyro" site="imu"/>
     <accelerometer name="body_linacc" site="imu"/>
     <framequat name="body_quat" objtype="site" objname="imu"/>
+    <rangefinder name="lidar_front" site="lidar_front"/>
+    <rangefinder name="lidar_left" site="lidar_left"/>
+    <rangefinder name="lidar_back" site="lidar_back"/>
+    <rangefinder name="lidar_right" site="lidar_right"/>
+    <rangefinder name="lidar_up" site="lidar_up"/>
+    <rangefinder name="lidar_down" site="lidar_down"/>
+    <rangefinder name="lidar_front_left" site="lidar_front_left"/>
+    <rangefinder name="lidar_front_right" site="lidar_front_right"/>
+    <rangefinder name="lidar_back_left" site="lidar_back_left"/>
+    <rangefinder name="lidar_back_right" site="lidar_back_right"/>
+    <rangefinder name="lidar_up_left" site="lidar_up_left"/>
+    <rangefinder name="lidar_up_right" site="lidar_up_right"/>
+    <rangefinder name="lidar_up_front" site="lidar_up_front"/>
+    <rangefinder name="lidar_up_back" site="lidar_up_back"/>
+    <rangefinder name="lidar_down_left" site="lidar_down_left"/>
+    <rangefinder name="lidar_down_right" site="lidar_down_right"/>
+    <rangefinder name="lidar_down_front" site="lidar_down_front"/>
+    <rangefinder name="lidar_down_back" site="lidar_down_back"/>
   </sensor>
 
   <keyframe>
