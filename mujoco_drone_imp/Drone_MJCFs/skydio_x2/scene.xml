@@ -1,6 +1,6 @@
 <mujoco model="Skydio X2 scene">
   <include file="x2.xml"/>
-
+  <include file="../../../obstacles/cylinder.xml"/>
   <statistic center="0 0 0.1" extent="0.6" meansize=".05"/>
 
   <visual>

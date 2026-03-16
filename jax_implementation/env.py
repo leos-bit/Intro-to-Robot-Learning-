@@ -28,6 +28,13 @@ def _safe_l2_norm(x: jax.Array, axis=None) -> jax.Array:
     x = jp.asarray(x, dtype=jp.float32)
     return jp.sqrt(jp.sum(jp.square(x), axis=axis) + 1e-8)
 
+
+def _softmin(x: jax.Array, temperature: float) -> jax.Array:
+    """Smooth minimum for stable clearance shaping."""
+    x = jp.asarray(x, dtype=jp.float32)
+    tau = jp.asarray(max(float(temperature), 1e-3), dtype=jp.float32)
+    return -tau * jax.nn.logsumexp(-x / tau)
+
 def default_config() -> config_dict.ConfigDict:
       cfg = config_dict.create(
         ctrl_dt=0.01,
@@ -39,22 +46,22 @@ def default_config() -> config_dict.ConfigDict:
         nconmax=64,
         njmax=256,
         model_path=_XML_PATH,
-        xylim=5,
-        zlim=5,
+        xylim=10,
+        zlim=8,
         vellim=2,
         yawrate_lim=2,
         action_scale=0.5,
-        spawn_z_min=0.8,
-        target_dist_min=0.3,
-        target_dist_max=2.5,
+        spawn_z_min=0.3,
+        target_dist_min=2,
+        target_dist_max=7,
         collision_terminate_steps=50,
-        w_progress=1.0,
+        w_progress=5.0,
         w_energy=0.05,
         w_smooth=0.10,
         w_speed=0.02,
-        r_collision=6.0,
-        r_goal=35.0,
-        termination_penalty=5.0,
+        r_collision=10.0,
+        r_goal=50.0,
+        termination_penalty=8.0,
         eps_goal=0.5,
         terminate_on_collision=True,
         # k_xy=0.45,
@@ -101,8 +108,23 @@ def default_config() -> config_dict.ConfigDict:
         safety_xy_scale=1.5,
         safety_z_low=-0.1,
         safety_z_high_scale=1.5,
+
         safety_speed_scale=5.0,
         max_steps=2000,
+        max_active_obstacles=15,
+        obstacle_center_z=3.2,
+        obstacle_spawn_clearance=1.0,
+        obstacle_target_clearance=0.8,
+        obstacle_min_separation=0.8,
+        obstacle_sample_margin=0.6,
+        w_obs=0.5,
+        lidar_warn_dist=2.0,
+        obstacle_safe_dist=0.8,
+        lidar_softmin_tau=0.5,
+        lidar_risk_weight=0.5,
+        true_obstacle_risk_weight=1.0,
+        drone_clearance_radius=0.25,
+        obstacle_radius=0.2,
       )
       cfg.gain_arr = jp.array([
           cfg.k_xy,
@@ -137,6 +159,10 @@ class newDrone(mjx_env.MjxEnv):
                 self._mj_model.opt.iterations = int(solver_iterations)
 
             self._mjx_model = mjx.put_model(self._mj_model, impl=self._config.impl)
+            self._qpos0 = jp.asarray(self._mj_model.qpos0, dtype=jp.float32)
+            self._track_camera_id = mujoco.mj_name2id(
+                self._mj_model, mujoco.mjtObj.mjOBJ_CAMERA, "track"
+            )
             self._last_info: Optional[dict[str, jax.Array]] = None
             self.max_steps = int(self._config.get("max_steps", self._config.episode_length))
             self.xylim = float(self._config.xylim)
@@ -156,7 +182,7 @@ class newDrone(mjx_env.MjxEnv):
             self.r_collision = float(max(0.0, float(self._config.r_collision)))
             self.r_goal = float(max(0.0, float(self._config.r_goal)))
             self.termination_penalty = float(max(0.0, float(self._config.termination_penalty)))
-            self.eps_goal = float(max(1e-3, float(self._config.eps_goal)))
+            self.eps_goal = float(max(0.1, float(self._config.eps_goal)))
             # self.k_xy = float(self._config.k_xy)
             # self.k_z = float(self._config.k_z)
             # self.k_yaw = float(self._config.k_yaw)
@@ -193,10 +219,10 @@ class newDrone(mjx_env.MjxEnv):
             self.position_hold_epsilon = float(max(0.0, float(self._config.position_hold_epsilon)))
             self.yaw_hold_epsilon = float(max(0.0, float(self._config.yaw_hold_epsilon)))
             self.hover_speed_epsilon = float(
-                max(0.0, float(self._config.get("hover_speed_epsilon", 0.15)))
+                max(0.0, float(self._config.get("hover_speed_epsilon", 0.3)))
             )
             self.hover_success_steps = max(
-                1, int(self._config.get("hover_success_steps", 50))
+                1, int(self._config.get("hover_success_steps", 15))
             )
             self.landing_radius = float(max(0.1, float(self._config.get("landing_radius", 1.5))))
             self.landing_xy_speed = float(max(0.05, float(self._config.get("landing_xy_speed", 0.35))))
@@ -263,6 +289,96 @@ class newDrone(mjx_env.MjxEnv):
             )
             self._action_low = jp.full((4,), -1.0, dtype=jp.float32)
             self._action_high = jp.full((4,), 1.0, dtype=jp.float32)
+            self.obstacle_center_z = float(self._config.get("obstacle_center_z", 0.75))
+            self.obstacle_spawn_clearance = float(
+                max(0.0, float(self._config.get("obstacle_spawn_clearance", 1.0)))
+            )
+            self.obstacle_target_clearance = float(
+                max(0.0, float(self._config.get("obstacle_target_clearance", 0.8)))
+            )
+            self.obstacle_min_separation = float(
+                max(0.0, float(self._config.get("obstacle_min_separation", 0.8)))
+            )
+            self.obstacle_sample_margin = float(
+                max(0.0, float(self._config.get("obstacle_sample_margin", 0.6)))
+            )
+            self.w_obs = float(max(0.0, float(self._config.get("w_obs", 0.1))))
+            self.lidar_warn_dist = float(
+                max(0.0, float(self._config.get("lidar_warn_dist", 2.0)))
+            )
+            self.obstacle_safe_dist = float(
+                max(0.0, float(self._config.get("obstacle_safe_dist", 0.8)))
+            )
+            self.lidar_softmin_tau = float(
+                max(1e-3, float(self._config.get("lidar_softmin_tau", 0.5)))
+            )
+            self.lidar_risk_weight = float(
+                max(0.0, float(self._config.get("lidar_risk_weight", 0.5)))
+            )
+            self.true_obstacle_risk_weight = float(
+                max(0.0, float(self._config.get("true_obstacle_risk_weight", 1.0)))
+            )
+            self.drone_clearance_radius = float(
+                max(0.0, float(self._config.get("drone_clearance_radius", 0.25)))
+            )
+            self.obstacle_radius = float(
+                max(0.0, float(self._config.get("obstacle_radius", 0.2)))
+            )
+            self._obstacle_quat = jp.array([1.0, 0.0, 0.0, 0.0], dtype=jp.float32)
+            self._obstacle_body_names = self._discover_obstacle_body_names()
+            self.max_obstacles = len(self._obstacle_body_names)
+            requested_max_active = int(
+                self._config.get("max_active_obstacles", self.max_obstacles)
+            )
+            self.max_active_obstacles = min(
+                max(requested_max_active, 0), self.max_obstacles
+            )
+            self._obstacle_mocap_ids = self._build_obstacle_mocap_ids(self._obstacle_body_names)
+            template_data = mujoco.MjData(self._mj_model)
+            mujoco.mj_forward(self._mj_model, template_data)
+            self._data0 = mjx.put_data(
+                self._mj_model,
+                template_data,
+                impl=self._config.impl,
+                nconmax=self._config.nconmax,
+                njmax=self._config.njmax,
+            )
+            self._default_mocap_pos = jp.asarray(template_data.mocap_pos, dtype=jp.float32)
+            self._default_mocap_quat = jp.asarray(template_data.mocap_quat, dtype=jp.float32)
+            if self.max_obstacles > 0:
+                self._obstacle_park_positions = self._default_mocap_pos[
+                    jp.asarray(self._obstacle_mocap_ids, dtype=jp.int32)
+                ]
+                self._obstacle_park_quats = self._default_mocap_quat[
+                    jp.asarray(self._obstacle_mocap_ids, dtype=jp.int32)
+                ]
+            else:
+                self._obstacle_park_positions = jp.zeros((0, 3), dtype=jp.float32)
+                self._obstacle_park_quats = jp.zeros((0, 4), dtype=jp.float32)
+            self._obstacle_rel_xy_lim = self.obs_xy_lim + self.xylim
+            self._obstacle_rel_z_lim = self.obs_z_high + abs(self.obstacle_center_z)
+            self._obstacle_rel_low = jp.tile(
+                jp.array(
+                    [
+                        -self._obstacle_rel_xy_lim,
+                        -self._obstacle_rel_xy_lim,
+                        -self._obstacle_rel_z_lim,
+                    ],
+                    dtype=jp.float32,
+                )[None, :],
+                (self.max_obstacles, 1),
+            )
+            self._obstacle_rel_high = jp.tile(
+                jp.array(
+                    [
+                        self._obstacle_rel_xy_lim,
+                        self._obstacle_rel_xy_lim,
+                        self._obstacle_rel_z_lim,
+                    ],
+                    dtype=jp.float32,
+                )[None, :],
+                (self.max_obstacles, 1),
+            )
 
             self.lidar_max_dist = 6.0
             # Cache sensor slices once so sensordata reads do not depend on XML order.
@@ -293,6 +409,10 @@ class newDrone(mjx_env.MjxEnv):
                 self._sensor_slice(name) for name in self._lidar_sensor_names
             )
             self.num_lidar = len(self._lidar_sensor_slices)
+            self._horizontal_lidar_indices = jp.asarray(
+                [0, 1, 2, 3, 6, 7, 8, 9],
+                dtype=jp.int32,
+            )
             
             self.obs_spec = {
                 "agent_pos_xy": {
@@ -342,7 +462,25 @@ class newDrone(mjx_env.MjxEnv):
                     "high": jp.full((self.num_lidar,), self.lidar_max_dist, dtype=jp.float32),
                     "shape": (self.num_lidar,),
                     "dtype": jp.float32,
-                    },
+                },
+                "obstacle_rel": {
+                    "low": self._obstacle_rel_low,
+                    "high": self._obstacle_rel_high,
+                    "shape": (self.max_obstacles, 3),
+                    "dtype": jp.float32,
+                },
+                "obstacle_mask": {
+                    "low": jp.zeros((self.max_obstacles,), dtype=jp.float32),
+                    "high": jp.ones((self.max_obstacles,), dtype=jp.float32),
+                    "shape": (self.max_obstacles,),
+                    "dtype": jp.float32,
+                },
+                "num_active": {
+                    "low": jp.zeros((1,), dtype=jp.float32),
+                    "high": jp.full((1,), float(self.max_active_obstacles), dtype=jp.float32),
+                    "shape": (1,),
+                    "dtype": jp.float32,
+                },
 
             }
             self.action_spec = {
@@ -374,8 +512,133 @@ class newDrone(mjx_env.MjxEnv):
         start = int(self._mj_model.sensor_adr[sensor_id])
         dim = int(self._mj_model.sensor_dim[sensor_id])
         return slice(start, start + dim)
+
+    def _discover_obstacle_body_names(self) -> tuple[str, ...]:
+        obstacle_names: list[str] = []
+        for body_id in range(self._mj_model.nbody):
+            body_name = mujoco.mj_id2name(self._mj_model, mujoco.mjtObj.mjOBJ_BODY, body_id)
+            if body_name and body_name.startswith("obstacle_"):
+                obstacle_names.append(body_name)
+        return tuple(sorted(obstacle_names, key=lambda name: int(name.rsplit("_", 1)[1])))
+
+    def _build_obstacle_mocap_ids(self, obstacle_body_names: tuple[str, ...]) -> tuple[int, ...]:
+        mocap_ids = []
+        for body_name in obstacle_body_names:
+            body_id = mujoco.mj_name2id(self._mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+            mocap_id = int(self._mj_model.body_mocapid[body_id])
+            if mocap_id < 0:
+                raise ValueError(f"Obstacle body {body_name} must be a mocap body.")
+            mocap_ids.append(mocap_id)
+        return tuple(mocap_ids)
+
+    def _extract_obstacle_positions(self, data: mjx.Data) -> jax.Array:
+        if self.max_obstacles == 0:
+            return jp.zeros((0, 3), dtype=jp.float32)
+        return jp.stack([data.mocap_pos[mocap_id] for mocap_id in self._obstacle_mocap_ids])
+
+    def _place_obstacles_in_mocap(
+        self,
+        base_mocap_pos: jax.Array,
+        base_mocap_quat: jax.Array,
+        obstacle_positions: jax.Array,
+        obstacle_mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        mocap_pos = jp.asarray(base_mocap_pos, dtype=jp.float32)
+        mocap_quat = jp.asarray(base_mocap_quat, dtype=jp.float32)
+        obstacle_mask = jp.asarray(obstacle_mask, dtype=jp.bool_)
+        for idx, mocap_id in enumerate(self._obstacle_mocap_ids):
+            mocap_pos = mocap_pos.at[mocap_id].set(
+                jp.where(obstacle_mask[idx], obstacle_positions[idx], self._obstacle_park_positions[idx])
+            )
+            mocap_quat = mocap_quat.at[mocap_id].set(
+                jp.where(obstacle_mask[idx], self._obstacle_quat, self._obstacle_park_quats[idx])
+            )
+        return mocap_pos, mocap_quat
+
+    def _sample_obstacles(
+        self,
+        rng: jax.Array,
+        agent_location: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        if self.max_obstacles == 0 or self.max_active_obstacles == 0:
+            empty_mask = jp.zeros((self.max_obstacles,), dtype=jp.float32)
+            return self._obstacle_park_positions, empty_mask, jp.array(0, dtype=jp.int32)
+
+        rng, count_rng = jax.random.split(rng)
+        num_active = jax.random.randint(
+            count_rng,
+            (),
+            minval=0,
+            maxval=self.max_active_obstacles + 1,
+            dtype=jp.int32,
+        )
+        candidate_rngs = jax.random.split(rng, self.max_obstacles)
+        sample_limit = max(self.xylim - self.obstacle_sample_margin, 1e-3)
+        obstacle_positions = self._obstacle_park_positions
+        obstacle_mask = jp.zeros((self.max_obstacles,), dtype=jp.bool_)
+        num_candidates = 256
+
+        for idx in range(self.max_obstacles):
+            rx, ry = jax.random.split(candidate_rngs[idx])
+            candidates_xy = jp.stack(
+                [
+                    jax.random.uniform(
+                        rx,
+                        shape=(num_candidates,),
+                        minval=-sample_limit,
+                        maxval=sample_limit,
+                    ),
+                    jax.random.uniform(
+                        ry,
+                        shape=(num_candidates,),
+                        minval=-sample_limit,
+                        maxval=sample_limit,
+                    ),
+                ],
+                axis=1,
+            ).astype(jp.float32)
+            candidates = jp.concatenate(
+                [
+                    candidates_xy,
+                    jp.full((num_candidates, 1), self.obstacle_center_z, dtype=jp.float32),
+                ],
+                axis=1,
+            )
+
+            agent_dists = jp.linalg.norm(candidates[:, :2] - agent_location[None, :2], axis=1)
+            valid = agent_dists >= self.obstacle_spawn_clearance
+            if idx > 0:
+                pairwise_dists = jp.linalg.norm(
+                    candidates[:, None, :2] - obstacle_positions[None, :idx, :2],
+                    axis=-1,
+                )
+                prev_mask = obstacle_mask[:idx][None, :]
+                valid = valid & jp.all(
+                    (~prev_mask) | (pairwise_dists >= self.obstacle_min_separation),
+                    axis=1,
+                )
+
+            first_valid = jp.argmax(valid.astype(jp.int32))
+            chosen_idx = jp.where(jp.any(valid), first_valid, num_candidates - 1)
+            place_obstacle = (idx < num_active) & jp.any(valid)
+            chosen_position = jp.where(
+                place_obstacle,
+                candidates[chosen_idx],
+                self._obstacle_park_positions[idx],
+            )
+            obstacle_positions = obstacle_positions.at[idx].set(chosen_position)
+            obstacle_mask = obstacle_mask.at[idx].set(place_obstacle)
+
+        actual_num_active = jp.sum(obstacle_mask.astype(jp.int32))
+        return obstacle_positions, obstacle_mask.astype(jp.float32), actual_num_active
     
-    def _sample_target(self, rng: jax.Array, agent_location: jax.Array) -> jax.Array:
+    def _sample_target(
+        self,
+        rng: jax.Array,
+        agent_location: jax.Array,
+        obstacle_positions: Optional[jax.Array] = None,
+        obstacle_mask: Optional[jax.Array] = None,
+    ) -> jax.Array:
 
         num_samples = 200
         rx, ry, rz = jax.random.split(rng, 3)
@@ -405,10 +668,66 @@ class newDrone(mjx_env.MjxEnv):
         valid = dists >= self.target_dist_min
         if self.target_dist_max is not None:
             valid = jp.logical_and(valid, dists <= self.target_dist_max)
+        if obstacle_positions is not None and obstacle_mask is not None and self.max_obstacles > 0:
+            obstacle_mask = jp.asarray(obstacle_mask, dtype=jp.bool_)
+            obstacle_dists = jp.linalg.norm(
+                candidates[:, None, :2] - obstacle_positions[None, :, :2],
+                axis=-1,
+            )
+            valid = valid & jp.all(
+                (~obstacle_mask[None, :]) | (obstacle_dists >= self.obstacle_target_clearance),
+                axis=1,
+            )
 
         first_valid = jp.argmax(valid.astype(jp.int32))
         chosen_idx = jp.where(jp.any(valid), first_valid, num_samples - 1)
         return candidates[chosen_idx]
+
+    def _obstacle_reward_terms(
+        self,
+        agent_location: jax.Array,
+        lidar: jax.Array,
+        obstacle_positions: jax.Array,
+        obstacle_mask: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        horizontal_lidar = jp.asarray(lidar, dtype=jp.float32)[self._horizontal_lidar_indices]
+        lidar_clearance = _softmin(horizontal_lidar, self.lidar_softmin_tau)
+
+        obstacle_mask = jp.asarray(obstacle_mask, dtype=jp.bool_)
+        if self.max_obstacles > 0:
+            obstacle_xy_dist = jp.linalg.norm(
+                obstacle_positions[:, :2] - agent_location[None, :2],
+                axis=-1,
+            )
+            true_clearance_all = obstacle_xy_dist - (
+                self.drone_clearance_radius + self.obstacle_radius
+            )
+            true_clearance_all = jp.where(
+                obstacle_mask,
+                true_clearance_all,
+                jp.full_like(true_clearance_all, jp.inf),
+            )
+            true_clearance = jp.where(
+                jp.any(obstacle_mask),
+                jp.min(true_clearance_all),
+                jp.asarray(self.lidar_max_dist, dtype=jp.float32),
+            )
+        else:
+            true_clearance = jp.asarray(self.lidar_max_dist, dtype=jp.float32)
+
+        lidar_risk = self.lidar_risk_weight * jp.square(
+            jp.maximum(0.0, self.lidar_warn_dist - lidar_clearance)
+        )
+        true_risk = self.true_obstacle_risk_weight * jp.square(
+            jp.maximum(0.0, self.obstacle_safe_dist - true_clearance)
+        )
+        obstacle_risk = lidar_risk + true_risk
+        return (
+            jp.asarray(lidar_clearance, dtype=jp.float32),
+            jp.asarray(true_clearance, dtype=jp.float32),
+            jp.asarray(obstacle_risk, dtype=jp.float32),
+        )
+
     def _get_info(self, agent_location: jax.Array, target: jax.Array, initial_distance: jax.Array):
         distance = jp.linalg.norm(agent_location - target)
         return {
@@ -416,7 +735,7 @@ class newDrone(mjx_env.MjxEnv):
             "initial_distance": initial_distance,
         }
     def reset(self, rng: jax.Array) -> mjx_env.State:
-        rng, spawn_rng, target_rng = jax.random.split(rng, 3)
+        rng, spawn_rng, obstacle_rng, target_rng = jax.random.split(rng, 4)
         sx, sy, sz = jax.random.split(spawn_rng, 3)
         z_span = max(self.zlim - self.spawn_z_min, 0.0)
         spawn_z = jax.random.uniform(
@@ -435,17 +754,26 @@ class newDrone(mjx_env.MjxEnv):
             dtype=jp.float32,
         )
 
-        qpos = jp.zeros((self.mjx_model.nq,), dtype=jp.float32)
+        qpos = self._qpos0
         qpos = qpos.at[:3].set(agent_location)
         qpos = qpos.at[3:7].set(jp.array([1.0, 0.0, 0.0, 0.0], dtype=jp.float32))
+        obstacle_positions, obstacle_mask, num_active = self._sample_obstacles(
+            obstacle_rng, agent_location
+        )
+        mocap_pos, mocap_quat = self._place_obstacles_in_mocap(
+            self._default_mocap_pos,
+            self._default_mocap_quat,
+            obstacle_positions,
+            obstacle_mask,
+        )
         qvel = jp.zeros((self.mjx_model.nv,), dtype=jp.float32)
-        data = mjx_env.make_data(
-            self.mj_model,
+        data = self._data0.replace(
             qpos=qpos,
             qvel=qvel,
-            impl=self.mjx_model.impl.value,
-            nconmax=self._config.nconmax,
-            njmax=self._config.njmax,
+            act=jp.zeros_like(self._data0.act),
+            qacc_warmstart=jp.zeros_like(self._data0.qacc_warmstart),
+            mocap_pos=mocap_pos,
+            mocap_quat=mocap_quat,
         )
         data = data.replace(ctrl=self.hover_ctrl.astype(data.ctrl.dtype))
         data = mjx.forward(self.mjx_model, data)
@@ -458,8 +786,21 @@ class newDrone(mjx_env.MjxEnv):
             agent_yawrate,
             lidar,
         ) = self._extract_body_state(data)
-        target = self._sample_target(target_rng, agent_location)
+        obstacle_positions = self._extract_obstacle_positions(data)
+        target = self._sample_target(
+            target_rng,
+            agent_location,
+            obstacle_positions=obstacle_positions,
+            obstacle_mask=obstacle_mask,
+        )
         initial_target_distance = jp.linalg.norm(target - agent_location)
+        lidar_clearance, true_obstacle_clearance, obstacle_risk = self._obstacle_reward_terms(
+            agent_location,
+            lidar,
+            obstacle_positions,
+            obstacle_mask,
+        )
+
         info = {
             "rng": rng,
             "agent_location": agent_location,
@@ -483,7 +824,15 @@ class newDrone(mjx_env.MjxEnv):
             "distance": initial_target_distance,
             "initial_distance": initial_target_distance,
             "lidar": lidar,
+            "obstacle_positions": obstacle_positions,
+            "obstacle_mask": obstacle_mask,
+            "num_active": num_active.astype(jp.int32),
+            "prev_obstacle_risk": obstacle_risk,
+            "obstacle_risk": obstacle_risk,
+            "lidar_clearance": lidar_clearance,
+            "true_obstacle_clearance": true_obstacle_clearance,
             "r_prog": jp.array(0.0, dtype=jp.float32),
+            "r_obs": jp.array(0.0, dtype=jp.float32),
             "r_coll": jp.array(0.0, dtype=jp.float32),
             "r_energy": jp.array(0.0, dtype=jp.float32),
             "r_smooth": jp.array(0.0, dtype=jp.float32),
@@ -526,12 +875,15 @@ class newDrone(mjx_env.MjxEnv):
             "distance": jp.asarray(distance, dtype=jp.float32),
             "initial_distance": jp.asarray(initial_distance, dtype=jp.float32),
             "r_prog": zero,
+            "r_obs": zero,
             "r_coll": zero,
             "r_energy": zero,
             "r_smooth": zero,
             "r_safety": zero,
             "r_speed": zero,
             "r_terminal": zero,
+            "lidar_clearance": jp.asarray(self.lidar_max_dist, dtype=jp.float32),
+            "true_obstacle_clearance": jp.asarray(self.lidar_max_dist, dtype=jp.float32),
             "raw_action_l2": zero,
             "scaled_action_l2": zero,
             # Keep all metrics float32 so Brax EvalWrapper aggregation is type-stable.
@@ -590,6 +942,25 @@ class newDrone(mjx_env.MjxEnv):
             neginf=0.0,
         ).astype(jp.float32)
         lidar = jp.clip(lidar, 0.0, self.lidar_max_dist)
+        obstacle_positions = jp.nan_to_num(
+            info["obstacle_positions"],
+            nan=0.0,
+            posinf=self._obstacle_rel_xy_lim,
+            neginf=-self._obstacle_rel_xy_lim,
+        ).astype(jp.float32)
+        obstacle_mask = jp.clip(
+            jp.asarray(info["obstacle_mask"], dtype=jp.float32),
+            0.0,
+            1.0,
+        )
+        obstacle_rel = obstacle_positions - agent_location[None, :]
+        obstacle_rel = jp.where(obstacle_mask[:, None] > 0.0, obstacle_rel, 0.0)
+        obstacle_rel = jp.clip(obstacle_rel, self._obstacle_rel_low, self._obstacle_rel_high)
+        num_active = jp.clip(
+            jp.asarray(info["num_active"], dtype=jp.float32).reshape((1,)),
+            0.0,
+            float(self.max_active_obstacles),
+        )
         return {
             "agent_pos_xy": jp.clip(agent_location[0:2], self._obs_xy_low, self._obs_xy_high),
             "agent_pos_z": jp.clip(agent_location[2:3], self._obs_z_low, self._obs_z_high),
@@ -599,6 +970,9 @@ class newDrone(mjx_env.MjxEnv):
             "agent_yawrate": jp.clip(agent_yawrate, self._obs_yaw_low, self._obs_yaw_high),
             "goal_vec": jp.clip(goal_vec, self._obs_goal_low, self._obs_goal_high),
             "lidar": lidar,
+            "obstacle_rel": obstacle_rel,
+            "obstacle_mask": obstacle_mask,
+            "num_active": num_active,
         }
 
     def _pack_pid_state(self, integral: jax.Array, prev_error: jax.Array) -> jax.Array:
@@ -1059,6 +1433,7 @@ class newDrone(mjx_env.MjxEnv):
             agent_yawrate,
             lidar,
         ) = self._extract_body_state(data)
+        obstacle_positions = self._extract_obstacle_positions(data)
         info = {
             **state.info,
             **controller_state,
@@ -1068,6 +1443,7 @@ class newDrone(mjx_env.MjxEnv):
             "agent_orientation": agent_orientation,
             "agent_yawrate": agent_yawrate,
             "lidar": lidar,
+            "obstacle_positions": obstacle_positions,
         }
         obs = self._get_obs(info)
 
@@ -1120,6 +1496,13 @@ class newDrone(mjx_env.MjxEnv):
         collision = collision_streak >= self.collision_terminate_steps
 
         r_prog = self.w_progress * (info["prev_distance"] - dist)
+        lidar_clearance, true_obstacle_clearance, obstacle_risk = self._obstacle_reward_terms(
+            info["agent_location"],
+            info["lidar"],
+            info["obstacle_positions"],
+            info["obstacle_mask"],
+        )
+        r_obs = self.w_obs * (info["prev_obstacle_risk"] - obstacle_risk)
         r_coll = jp.where(collision, -self.r_collision, 0.0)
         r_energy = -self.w_energy * jp.dot(scaled_action, scaled_action)
         r_smooth = -self.w_smooth * jp.dot(delta_action, delta_action)
@@ -1137,7 +1520,7 @@ class newDrone(mjx_env.MjxEnv):
         r_safety = jp.where(safety_terminated, -self.r_collision, 0.0)
         r_speed = -self.w_speed * speed_sq
 
-        reward = r_prog + r_coll + r_energy + r_smooth + r_safety + r_speed
+        reward = r_prog + r_obs + r_coll + r_energy + r_smooth + r_safety + r_speed
         hovering_at_goal = (dist <= self.eps_goal) & (
             speed_sq <= jp.square(self.hover_speed_epsilon)
         )
@@ -1177,12 +1560,19 @@ class newDrone(mjx_env.MjxEnv):
             "distance": to_f32(dist),
             "initial_distance": to_f32(info["initial_target_distance"]),
             "r_prog": to_f32(jp.where(invalid_state, 0.0, r_prog)),
+            "r_obs": to_f32(jp.where(invalid_state, 0.0, r_obs)),
             "r_coll": to_f32(jp.where(invalid_state, -2.0 * self.r_collision, r_coll)),
             "r_energy": to_f32(jp.where(invalid_state, 0.0, r_energy)),
             "r_smooth": to_f32(jp.where(invalid_state, 0.0, r_smooth)),
             "r_safety": to_f32(jp.where(invalid_state, 0.0, r_safety)),
             "r_speed": to_f32(jp.where(invalid_state, 0.0, r_speed)),
             "r_terminal": to_f32(jp.where(invalid_state, -self.termination_penalty, r_terminal)),
+            "lidar_clearance": to_f32(
+                jp.where(invalid_state, info["lidar_clearance"], lidar_clearance)
+            ),
+            "true_obstacle_clearance": to_f32(
+                jp.where(invalid_state, info["true_obstacle_clearance"], true_obstacle_clearance)
+            ),
             "raw_action_l2": to_f32(_safe_l2_norm(raw_action)),
             "scaled_action_l2": to_f32(_safe_l2_norm(scaled_action)),
             "success": to_f32(success_i),
@@ -1218,7 +1608,16 @@ class newDrone(mjx_env.MjxEnv):
             ),
             "distance": dist,
             "initial_distance": info["initial_target_distance"],
+            "prev_obstacle_risk": jp.where(
+                invalid_state,
+                info["prev_obstacle_risk"],
+                obstacle_risk,
+            ),
+            "obstacle_risk": jp.where(invalid_state, info["obstacle_risk"], obstacle_risk),
+            "lidar_clearance": metrics["lidar_clearance"],
+            "true_obstacle_clearance": metrics["true_obstacle_clearance"],
             "r_prog": metrics["r_prog"],
+            "r_obs": metrics["r_obs"],
             "r_coll": metrics["r_coll"],
             "r_energy": metrics["r_energy"],
             "r_smooth": metrics["r_smooth"],
@@ -1342,6 +1741,9 @@ def _sync_viewer_data(env: newDrone, viewer_data: mujoco.MjData, state: mjx_env.
     viewer_data.qpos[:] = np.asarray(state.data.qpos)
     viewer_data.qvel[:] = np.asarray(state.data.qvel)
     viewer_data.ctrl[:] = np.asarray(state.data.ctrl)
+    if env.mj_model.nmocap > 0:
+        viewer_data.mocap_pos[:] = np.asarray(state.data.mocap_pos)
+        viewer_data.mocap_quat[:] = np.asarray(state.data.mocap_quat)
     mujoco.mj_forward(env.mj_model, viewer_data)
 
 
@@ -1378,6 +1780,10 @@ def run_pid_demo(
         viewer_data = mujoco.MjData(env.mj_model)
         _sync_viewer_data(env, viewer_data, state)
         viewer = mujoco.viewer.launch_passive(env.mj_model, viewer_data)
+        if env._track_camera_id >= 0:
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+            viewer.cam.fixedcamid = env._track_camera_id
+            viewer.sync()
 
     print(
         "Running PID demo with render. "

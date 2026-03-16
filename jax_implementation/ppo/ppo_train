@@ -1,0 +1,817 @@
+"""Train Drone_env (MJX) with MuJoCo Playground PPO and optional rscope dumps."""
+
+from __future__ import annotations
+
+import argparse
+import datetime
+import functools
+import inspect
+import json
+import sys
+import time
+from pathlib import Path
+from typing import Any
+
+from brax.training.agents.ppo import networks as ppo_networks
+from brax.training.agents.ppo import train as ppo
+import jax
+import jax.numpy as jp
+from ml_collections import config_dict
+from mujoco_playground import wrapper
+from mujoco_playground._src import mjx_env
+import numpy as np
+
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+
+from jax_implementation.env import default_config, newDrone
+try:
+    from tqdm import tqdm
+except ImportError:
+    tqdm = None
+
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
+
+
+def _rscope_summary_fn(full_states, obs, rew, done):
+    """Small summary callback used by rscope rollout saver."""
+    del full_states, obs
+    done_mask = jp.cumsum(done, axis=0)
+    valid_rewards = rew * (done_mask == 0)
+    ep_rewards = jp.sum(valid_rewards, axis=0)
+    print(
+        "Collected rscope rollouts with reward "
+        f"{float(ep_rewards.mean()):.3f} +- {float(ep_rewards.std()):.3f}"
+    )
+
+
+def _canonicalize_model_assets(assets: dict[str, bytes]) -> dict[str, bytes]:
+    """Deduplicate assets by basename for MuJoCo XML-from-string loading."""
+    chosen: dict[str, tuple[str, bytes]] = {}
+    for key, content in assets.items():
+        base = Path(key).name.lower()
+        prev = chosen.get(base)
+        if prev is None:
+            chosen[base] = (key, content)
+            continue
+        prev_key, _ = prev
+        # Prefer relative-path keys over basename aliases.
+        if ("/" in key) and ("/" not in prev_key):
+            chosen[base] = (key, content)
+    return {key: content for key, content in (chosen[b] for b in sorted(chosen))}
+
+
+def _default_ppo_cfg() -> config_dict.ConfigDict:
+    """PPO config tuned for stable MJX drone training."""
+    return config_dict.ConfigDict(
+        dict(
+            # Training timesteps - same as SB3
+            num_timesteps=20_000_000,
+            num_evals=20,
+            reward_scaling=0.5,
+            episode_length=2000,
+            normalize_observations=True,
+            action_repeat=1,
+            use_pmap_on_reset=True,
+            # Smaller unroll gives more frequent policy updates.
+            unroll_length=10,
+            num_minibatches=8,
+            num_updates_per_batch=8,
+            discounting=0.99,
+            learning_rate=3e-4,
+            entropy_cost=1e-2,
+            # Scaled num_envs for GPU parallelism
+            num_envs=1024,
+            num_eval_envs=128,
+            batch_size=1024,
+            max_grad_norm=1.0,
+            clipping_epsilon=0.2,
+            gae_lambda=0.95,
+            run_evals=True,
+            log_training_metrics=True,
+            training_metrics_steps=50_000,
+            network_factory=config_dict.ConfigDict(
+                dict(
+                    policy_hidden_layer_sizes=[512, 512],
+                    value_hidden_layer_sizes=[512, 512],
+                    policy_obs_key="state",
+                    value_obs_key="state",
+                )
+            ),
+        )
+    )
+
+
+class StateObsWrapper(wrapper.Wrapper):
+    """Convert dict observations from Drone_env into a single 'state' vector."""
+
+    def __init__(self, env: mjx_env.MjxEnv):
+        super().__init__(env)
+        self._model_assets = env.model_assets
+        if hasattr(env, "obs_spec"):
+            self._obs_keys = tuple(env.obs_spec.keys())
+        else:
+            # Fallback order if obs_spec is unavailable.
+            self._obs_keys = (
+                "agent_pos_xy",
+                "agent_pos_z",
+                "agent_orientation",
+                "agent_vel",
+                "target",
+                "agent_yawrate",
+                "goal_vec",
+            )
+        self._state_size = int(
+            sum(
+                int(np.prod(env.obs_spec[k]["shape"])) if hasattr(env, "obs_spec") else 0
+                for k in self._obs_keys
+            )
+        )
+        if self._state_size <= 0:
+            # Generic fallback if obs_spec is unavailable.
+            obs_size = env.observation_size
+            if isinstance(obs_size, dict):
+                self._state_size = int(
+                    sum(
+                        int(np.prod(v)) if isinstance(v, tuple) else int(v)
+                        for v in obs_size.values()
+                    )
+                )
+            else:
+                self._state_size = (
+                    int(np.prod(obs_size)) if isinstance(obs_size, tuple) else int(obs_size)
+                )
+
+    def _pack_obs(self, obs: dict[str, jax.Array]) -> dict[str, jax.Array]:
+        # Flatten each observation block so mixed shapes like obstacle_rel [N, 3]
+        # still pack into one PPO-ready state vector.
+        state = jp.concatenate(
+            [jp.asarray(obs[k], dtype=jp.float32).reshape((-1,)) for k in self._obs_keys],
+            axis=-1,
+        )
+        return {"state": state}
+
+    def reset(self, rng: jax.Array) -> mjx_env.State:
+        state = self.env.reset(rng)
+        return state.replace(obs=self._pack_obs(state.obs))
+
+    def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
+        state = self.env.step(state, action)
+        return state.replace(obs=self._pack_obs(state.obs))
+
+    @property
+    def observation_size(self):
+        return {"state": (self._state_size,)}
+
+
+def _build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--suffix", type=str, default=None)
+    parser.add_argument("--log_root", type=str, default="drone_training/artifacts/playground_ppo")
+    parser.add_argument(
+        "--tensorboard",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Enable TensorBoard logging for Playground PPO runs.",
+    )
+    parser.add_argument(
+        "--tensorboard_dir",
+        type=str,
+        default=None,
+        help="Optional TensorBoard output directory (default: <run_logdir>/tensorboard).",
+    )
+    parser.add_argument("--load_checkpoint_path", type=str, default=None)
+    parser.add_argument("--run_evals", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--progress_bar", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument(
+        "--log_training_metrics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Request periodic training loss metrics from Brax PPO (if supported).",
+    )
+    parser.add_argument(
+        "--training_metrics_steps",
+        type=int,
+        default=50_000,
+        help="Emit training metrics every N env steps (if supported).",
+    )
+
+    # Training parameters - defaults aligned with SB3
+    parser.add_argument("--num_timesteps", type=int, default=20_000_000)
+    parser.add_argument("--num_evals", type=int, default=20)
+    parser.add_argument("--num_envs", type=int, default=1024)
+    parser.add_argument("--num_eval_envs", type=int, default=128)
+    parser.add_argument("--episode_length", type=int, default=2000)
+    parser.add_argument("--batch_size", type=int, default=1024)
+    parser.add_argument("--unroll_length", type=int, default=10)
+    parser.add_argument("--num_minibatches", type=int, default=8)
+    parser.add_argument("--num_updates_per_batch", type=int, default=8)
+    parser.add_argument("--learning_rate", type=float, default=3e-4)
+    parser.add_argument("--entropy_cost", type=float, default=1e-2)
+    parser.add_argument("--discounting", type=float, default=0.99)
+    parser.add_argument("--gae_lambda", type=float, default=0.95)
+    parser.add_argument("--reward_scaling", type=float, default=0.5)
+    parser.add_argument("--clipping_epsilon", type=float, default=0.2)
+    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument(
+        "--use_pmap_on_reset",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
+    parser.add_argument(
+        "--normalize_observations",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument("--policy_obs_key", type=str, default="state")
+    parser.add_argument("--value_obs_key", type=str, default="state")
+    parser.add_argument(
+        "--policy_hidden_layer_sizes",
+        nargs="+",
+        type=int,
+        default=[512, 512],
+    )
+    parser.add_argument(
+        "--value_hidden_layer_sizes",
+        nargs="+",
+        type=int,
+        default=[512, 512],
+    )
+
+    parser.add_argument("--impl", type=str, default="jax")
+    parser.add_argument(
+        "--env_overrides",
+        type=str,
+        default=None,
+        help="JSON dict of env config overrides, e.g. '{\"action_scale\":0.35}'.",
+    )
+
+    parser.add_argument(
+        "--rscope_envs",
+        type=int,
+        default=0,
+        help="If >0, dump rollouts for rscope live viewer.",
+    )
+    parser.add_argument(
+        "--deterministic_rscope",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    return parser
+
+
+def _apply_env_overrides(env_cfg: config_dict.ConfigDict, overrides_json: str | None):
+    if not overrides_json:
+        return
+    overrides = json.loads(overrides_json)
+    if not isinstance(overrides, dict):
+        raise ValueError("--env_overrides must decode to a JSON object/dict.")
+    for key, value in overrides.items():
+        current_value = env_cfg.get(key, None)
+        if isinstance(current_value, jax.Array):
+            value = jp.asarray(value, dtype=current_value.dtype)
+        env_cfg[key] = value
+
+
+def _make_env_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
+    env_cfg = default_config()
+    env_cfg.impl = args.impl
+    env_cfg.max_steps = args.episode_length
+    env_cfg.episode_length = args.episode_length
+    _apply_env_overrides(env_cfg, args.env_overrides)
+    return env_cfg
+
+
+def _make_ppo_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
+    cfg = _default_ppo_cfg()
+    cfg.num_timesteps = args.num_timesteps
+    cfg.num_evals = args.num_evals
+    cfg.num_envs = args.num_envs
+    cfg.num_eval_envs = args.num_eval_envs
+    cfg.episode_length = args.episode_length
+    cfg.batch_size = args.batch_size
+    cfg.unroll_length = args.unroll_length
+    cfg.num_minibatches = args.num_minibatches
+    cfg.num_updates_per_batch = args.num_updates_per_batch
+    cfg.learning_rate = args.learning_rate
+    cfg.entropy_cost = args.entropy_cost
+    cfg.discounting = args.discounting
+    cfg.gae_lambda = args.gae_lambda
+    cfg.reward_scaling = args.reward_scaling
+    cfg.clipping_epsilon = args.clipping_epsilon
+    cfg.max_grad_norm = args.max_grad_norm
+    cfg.use_pmap_on_reset = args.use_pmap_on_reset
+    cfg.normalize_observations = args.normalize_observations
+    cfg.run_evals = args.run_evals
+    cfg.log_training_metrics = args.log_training_metrics
+    cfg.training_metrics_steps = args.training_metrics_steps
+    cfg.network_factory.policy_hidden_layer_sizes = list(args.policy_hidden_layer_sizes)
+    cfg.network_factory.value_hidden_layer_sizes = list(args.value_hidden_layer_sizes)
+    cfg.network_factory.policy_obs_key = args.policy_obs_key
+    cfg.network_factory.value_obs_key = args.value_obs_key
+    return cfg
+
+
+def _jsonable_config(value: Any) -> Any:
+    """Recursively convert ConfigDict/JAX values into JSON-safe Python types."""
+    if isinstance(value, config_dict.ConfigDict):
+        return {k: _jsonable_config(v) for k, v in value.items()}
+    if isinstance(value, dict):
+        return {str(k): _jsonable_config(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_config(v) for v in value]
+    if isinstance(value, jax.Array):
+        arr = np.asarray(value)
+        if arr.ndim == 0:
+            return arr.item()
+        return arr.tolist()
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return value.item()
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _safe_float_scalar(value: Any) -> float | None:
+    """Best-effort conversion to finite scalar float for TensorBoard."""
+    if value is None:
+        return None
+    if isinstance(value, (str, bytes)):
+        return None
+    if isinstance(value, (int, float, np.number)):
+        val = float(value)
+        return val if np.isfinite(val) else None
+    try:
+        arr = np.asarray(value)
+    except Exception:
+        return None
+    if arr.size != 1:
+        return None
+    try:
+        scalar = arr.item()
+    except Exception:
+        return None
+    if scalar is None:
+        return None
+    try:
+        val = float(scalar)
+    except (TypeError, ValueError):
+        return None
+    return val if np.isfinite(val) else None
+
+
+class TrainingLogger:
+    """SB3-style training logger with progress bar and metrics tracking."""
+
+    def __init__(
+        self,
+        total_timesteps: int,
+        num_envs: int,
+        episode_length: int,
+        use_progress_bar: bool = True,
+        log_interval: int = 1,
+    ):
+        self.total_timesteps = total_timesteps
+        self.num_envs = num_envs
+        self.episode_length = episode_length
+        self.use_progress_bar = use_progress_bar and tqdm is not None
+        self.log_interval = log_interval
+
+        self.start_time = time.time()
+        self.last_log_time = self.start_time
+        self.last_log_steps = 0
+        self.eval_count = 0
+
+        # Metrics history
+        self.metrics_history: list[dict] = []
+
+        # Progress bar
+        self.pbar = None
+        if self.use_progress_bar:
+            self.pbar = tqdm(
+                total=total_timesteps,
+                desc="Training",
+                unit="steps",
+                dynamic_ncols=True,
+                smoothing=0.1,
+            )
+
+    def _as_int(self, value: Any) -> int:
+        scalar = _safe_float_scalar(value)
+        if scalar is None:
+            return int(value)
+        return int(scalar)
+
+    def _as_float(self, value: Any, default: float = 0.0) -> float:
+        scalar = _safe_float_scalar(value)
+        if scalar is None:
+            return default
+        return float(scalar)
+
+    def log_eval(self, num_steps: int, metrics: dict[str, Any]):
+        """Log evaluation metrics (SB3-style)."""
+        self.eval_count += 1
+        current_time = time.time()
+        elapsed = current_time - self.start_time
+        num_steps_int = self._as_int(num_steps)
+        fps = num_steps_int / elapsed if elapsed > 0 else 0
+
+        # Update progress bar
+        if self.pbar is not None:
+            self.pbar.n = num_steps_int
+            self.pbar.refresh()
+
+        # Extract key metrics (Brax uses different keys than SB3)
+        eval_reward = self._as_float(metrics.get("eval/episode_reward", 0.0))
+        eval_reward_std = self._as_float(metrics.get("eval/episode_reward_std", 0.0))
+        # Brax uses avg_episode_length, not episode_length
+        eval_length = self._as_float(
+            metrics.get("eval/avg_episode_length", metrics.get("eval/episode_length", 0.0))
+        )
+
+        # Calculate FPS between logs
+        steps_since_log = num_steps_int - self.last_log_steps
+        time_since_log = current_time - self.last_log_time
+        recent_fps = steps_since_log / time_since_log if time_since_log > 0 else fps
+
+        # SB3-style output
+        print("-" * 60)
+        print(f"| {'rollout/':<20} |")
+        print(f"|   {'ep_len_mean':<17} | {eval_length:<20.1f} |")
+        print(f"|   {'ep_rew_mean':<17} | {eval_reward:<20.3f} |")
+        print(f"|   {'ep_rew_std':<17} | {eval_reward_std:<20.3f} |")
+        print(f"| {'time/':<20} |")
+        print(f"|   {'fps':<17} | {recent_fps:<20.0f} |")
+        print(f"|   {'iterations':<17} | {self.eval_count:<20d} |")
+        print(f"|   {'time_elapsed':<17} | {elapsed:<20.0f} |")
+        print(f"|   {'total_timesteps':<17} | {num_steps_int:<20d} |")
+
+        # Log training metrics if available
+        train_reward = self._as_float(
+            metrics.get("training/episode_reward", metrics.get("episode/sum_reward")),
+            default=float("nan"),
+        )
+        if np.isfinite(train_reward):
+            print(f"| {'train/':<20} |")
+            print(f"|   {'reward':<17} | {train_reward:<20.3f} |")
+
+        # Log additional metrics
+        if "training/entropy_loss" in metrics:
+            print(
+                f"|   {'entropy_loss':<17} | "
+                f"{self._as_float(metrics['training/entropy_loss']):<20.4f} |"
+            )
+        if "training/policy_loss" in metrics:
+            print(
+                f"|   {'policy_loss':<17} | "
+                f"{self._as_float(metrics['training/policy_loss']):<20.4f} |"
+            )
+        if "training/value_loss" in metrics:
+            print(
+                f"|   {'value_loss':<17} | "
+                f"{self._as_float(metrics['training/value_loss']):<20.4f} |"
+            )
+
+        print("-" * 60)
+
+        # Update tracking
+        self.last_log_time = current_time
+        self.last_log_steps = num_steps_int
+        logged_metrics = {}
+        for key, value in metrics.items():
+            scalar = _safe_float_scalar(value)
+            logged_metrics[key] = scalar if scalar is not None else value
+        self.metrics_history.append({"num_steps": num_steps_int, **logged_metrics})
+
+    def log_train(self, num_steps: int, metrics: dict[str, Any]):
+        """Log training metrics without full eval."""
+        num_steps_int = self._as_int(num_steps)
+        if self.pbar is not None:
+            self.pbar.n = num_steps_int
+            # Show training reward in progress bar if available
+            train_reward = self._as_float(
+                metrics.get("episode/sum_reward", metrics.get("training/episode_reward")),
+                default=float("nan"),
+            )
+            if np.isfinite(train_reward):
+                self.pbar.set_postfix({"train_rew": f"{train_reward:.2f}"}, refresh=True)
+            else:
+                self.pbar.refresh()
+
+    def close(self):
+        """Close progress bar and print summary."""
+        if self.pbar is not None:
+            self.pbar.close()
+
+        elapsed = time.time() - self.start_time
+        print(f"\nTraining completed in {elapsed:.2f}s")
+        print(f"Total timesteps: {self.total_timesteps}")
+        if self.metrics_history:
+            final_metrics = self.metrics_history[-1]
+            if "eval/episode_reward" in final_metrics:
+                print(f"Final eval reward: {final_metrics['eval/episode_reward']:.3f}")
+
+
+def train(args: argparse.Namespace):
+    env_cfg = _make_env_cfg(args)
+    ppo_cfg = _make_ppo_cfg(args)
+    env_cfg_json = _jsonable_config(env_cfg)
+    ppo_cfg_json = _jsonable_config(ppo_cfg)
+
+    env_base = newDrone(config=env_cfg)
+    canonical_assets = _canonicalize_model_assets(env_base.model_assets)
+    env_base._model_assets = canonical_assets
+    env = StateObsWrapper(env_base)
+    eval_env = None
+    if ppo_cfg.run_evals:
+        eval_env_base = newDrone(config=env_cfg)
+        eval_env_base._model_assets = canonical_assets
+        eval_env = StateObsWrapper(eval_env_base)
+
+    timestamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+    exp_name = f"DroneMJX-{timestamp}"
+    if args.suffix:
+        exp_name += f"-{args.suffix}"
+    logdir = Path(args.log_root).resolve() / exp_name
+    ckpt_dir = logdir / "checkpoints"
+    tb_dir = Path(args.tensorboard_dir).resolve() if args.tensorboard_dir else (logdir / "tensorboard")
+    ckpt_dir.mkdir(parents=True, exist_ok=True)
+    if args.tensorboard:
+        tb_dir.mkdir(parents=True, exist_ok=True)
+
+    with (logdir / "env_config.json").open("w", encoding="utf-8") as fp:
+        json.dump(env_cfg_json, fp, indent=2)
+    with (logdir / "ppo_config.json").open("w", encoding="utf-8") as fp:
+        json.dump(ppo_cfg_json, fp, indent=2)
+
+    # SB3-style header
+    print("=" * 60)
+    print(f"| Experiment: {exp_name}")
+    print(f"| Log dir: {logdir}")
+    print(f"| Checkpoint dir: {ckpt_dir}")
+    if args.tensorboard:
+        print(f"| TensorBoard dir: {tb_dir}")
+    print("=" * 60)
+    print("| PPO Hyperparameters:")
+    print(f"|   num_timesteps: {ppo_cfg.num_timesteps:,}")
+    print(f"|   num_envs: {ppo_cfg.num_envs}")
+    print(f"|   episode_length: {ppo_cfg.episode_length}")
+    print(f"|   learning_rate: {ppo_cfg.learning_rate}")
+    print(f"|   discounting (gamma): {ppo_cfg.discounting}")
+    print(f"|   gae_lambda: {ppo_cfg.gae_lambda}")
+    print(f"|   entropy_cost: {ppo_cfg.entropy_cost}")
+    print(f"|   clipping_epsilon: {ppo_cfg.clipping_epsilon}")
+    print(f"|   unroll_length: {ppo_cfg.unroll_length}")
+    print(f"|   num_minibatches: {ppo_cfg.num_minibatches}")
+    print(f"|   num_updates_per_batch: {ppo_cfg.num_updates_per_batch}")
+    print(f"|   use_pmap_on_reset: {ppo_cfg.use_pmap_on_reset}")
+    print(f"|   log_training_metrics: {ppo_cfg.log_training_metrics}")
+    print(f"|   training_metrics_steps: {ppo_cfg.training_metrics_steps}")
+    print(f"|   policy_hidden_layers: {ppo_cfg.network_factory.policy_hidden_layer_sizes}")
+    print(f"|   value_hidden_layers: {ppo_cfg.network_factory.value_hidden_layer_sizes}")
+    print("=" * 60)
+    print("| Environment Config:")
+    print(f"|   action_scale: {env_cfg.action_scale}")
+    print(f"|   target_dist_min: {env_cfg.target_dist_min}")
+    print(f"|   target_dist_max: {env_cfg.target_dist_max}")
+    print(f"|   eps_goal: {env_cfg.eps_goal}")
+    print(f"|   r_goal: {env_cfg.r_goal}")
+    print(f"|   w_progress: {env_cfg.w_progress}")
+    print(f"|   w_energy: {env_cfg.w_energy}")
+    print(f"|   w_smooth: {env_cfg.w_smooth}")
+    print(f"|   w_speed: {env_cfg.w_speed}")
+    print("=" * 60)
+
+    training_params: dict[str, Any] = dict(ppo_cfg)
+    network_factory_cfg = dict(training_params.pop("network_factory"))
+    # Keep num_eval_envs separate so we can pass it conditionally.
+    num_eval_envs = int(training_params.pop("num_eval_envs", ppo_cfg.num_eval_envs))
+
+    # Filter kwargs by installed Brax signature so train-loss metrics are passed when supported.
+    try:
+        train_sig = inspect.signature(ppo.train)
+        supported_train_args = set(train_sig.parameters.keys())
+    except Exception:
+        supported_train_args = set()
+    dropped_args = []
+    for key in list(training_params.keys()):
+        if supported_train_args and key not in supported_train_args:
+            dropped_args.append(key)
+            del training_params[key]
+    if dropped_args:
+        print(
+            "Dropping unsupported ppo.train args for this Brax version: "
+            + ", ".join(sorted(dropped_args))
+        )
+
+    network_factory = functools.partial(
+        ppo_networks.make_ppo_networks,
+        **network_factory_cfg,
+    )
+
+    restore_checkpoint_path = None
+    if args.load_checkpoint_path:
+        restore_checkpoint_path = str(Path(args.load_checkpoint_path).resolve())
+        print(f"Restoring from checkpoint: {restore_checkpoint_path}")
+
+    train_fn_kwargs = dict(
+        **training_params,
+        network_factory=network_factory,
+        seed=args.seed,
+        restore_checkpoint_path=restore_checkpoint_path,
+        save_checkpoint_path=str(ckpt_dir),
+        wrap_env_fn=wrapper.wrap_for_brax_training,
+    )
+    if (not supported_train_args) or ("num_eval_envs" in supported_train_args):
+        train_fn_kwargs["num_eval_envs"] = num_eval_envs
+    train_fn = functools.partial(ppo.train, **train_fn_kwargs)
+
+    # Initialize logger with progress bar
+    logger = TrainingLogger(
+        total_timesteps=ppo_cfg.num_timesteps,
+        num_envs=ppo_cfg.num_envs,
+        episode_length=ppo_cfg.episode_length,
+        use_progress_bar=args.progress_bar,
+    )
+    tb_writer = None
+    if args.tensorboard:
+        if SummaryWriter is None:
+            print("Warning: TensorBoard logging requested but SummaryWriter is unavailable.")
+            print("Install with `pip install tensorboard` (or install PyTorch with TensorBoard support).")
+        else:
+            tb_writer = SummaryWriter(log_dir=str(tb_dir))
+            tb_writer.add_text("run/experiment", exp_name, 0)
+            tb_writer.add_text("run/logdir", str(logdir), 0)
+            tb_writer.add_text("run/env_config", json.dumps(env_cfg_json, indent=2), 0)
+            tb_writer.add_text("run/ppo_config", json.dumps(ppo_cfg_json, indent=2), 0)
+
+    jit_start_time = time.monotonic()
+    first_progress_call = [True]
+    progress_calls = [0]
+    tb_logging_failed = [False]
+
+    def progress(num_steps, metrics):
+        nonlocal jit_start_time, tb_writer
+        if first_progress_call[0]:
+            jit_time = time.monotonic() - jit_start_time
+            print(f"\nJIT compilation time: {jit_time:.2f}s")
+            print(f"[debug] first progress callback at step={int(num_steps)}")
+            print(f"[debug] metric keys: {sorted(metrics.keys())}")
+            if tb_writer is not None:
+                tb_writer.add_scalar("time/jit_compile_seconds", jit_time, int(num_steps))
+            first_progress_call[0] = False
+
+        if ppo_cfg.run_evals and "eval/episode_reward" in metrics:
+            logger.log_eval(num_steps, metrics)
+        else:
+            logger.log_train(num_steps, metrics)
+
+        if tb_writer is not None:
+            try:
+                step = int(num_steps)
+                for key, value in metrics.items():
+                    scalar = _safe_float_scalar(value)
+                    if scalar is None:
+                        continue
+                    tb_writer.add_scalar(str(key), scalar, step)
+                # Stable aliases for frequently used reward curves.
+                train_reward = None
+                for reward_key in (
+                    "training/episode_reward",
+                    "episode/sum_reward",
+                    "eval/episode_reward",
+                ):
+                    if reward_key not in metrics:
+                        continue
+                    candidate = _safe_float_scalar(metrics[reward_key])
+                    if candidate is None:
+                        continue
+                    train_reward = candidate
+                    if reward_key != "eval/episode_reward":
+                        break
+                if train_reward is not None:
+                    tb_writer.add_scalar("train_reward/episode_reward", train_reward, step)
+                eval_reward = _safe_float_scalar(metrics.get("eval/episode_reward"))
+                if eval_reward is not None:
+                    tb_writer.add_scalar("eval_reward/episode_reward", eval_reward, step)
+                # Duplicate common loss keys under a stable namespace for quick filtering.
+                loss_tag_map = {
+                    "training/policy_loss": "train_loss/policy_loss",
+                    "training/value_loss": "train_loss/value_loss",
+                    "training/entropy_loss": "train_loss/entropy_loss",
+                    "training/total_loss": "train_loss/total_loss",
+                    "training/approx_kl": "train_loss/approx_kl",
+                    "training/clip_fraction": "train_loss/clip_fraction",
+                    "training/learning_rate": "train_loss/learning_rate",
+                }
+                for src_key, dst_key in loss_tag_map.items():
+                    if src_key not in metrics:
+                        continue
+                    scalar = _safe_float_scalar(metrics[src_key])
+                    if scalar is None:
+                        continue
+                    tb_writer.add_scalar(dst_key, scalar, step)
+                progress_calls[0] += 1
+                if progress_calls[0] % 5 == 0:
+                    tb_writer.flush()
+            except Exception as exc:
+                if not tb_logging_failed[0]:
+                    print(f"Warning: disabling TensorBoard callback logging due to error: {exc}")
+                    tb_logging_failed[0] = True
+                tb_writer = None
+
+    policy_params_fn = lambda *unused: None
+    if args.rscope_envs > 0:
+        try:
+            from rscope import brax as rscope_utils
+        except ImportError as exc:
+            raise ImportError(
+                "rscope is required when --rscope_envs > 0. Install with `pip install rscope`."
+            ) from exc
+
+        rscope_env = wrapper.wrap_for_brax_training(
+            StateObsWrapper(newDrone(config=env_cfg)),
+            episode_length=ppo_cfg.episode_length,
+            action_repeat=ppo_cfg.action_repeat,
+        )
+        # Wrapper inherits MjxEnv.model_assets but does not forward it to inner env.
+        # rscope expects trace_env.model_assets to exist.
+        rscope_env._model_assets = canonical_assets
+        rscope_handle = rscope_utils.BraxRolloutSaver(
+            rscope_env,
+            ppo_cfg,
+            False,  # vision
+            args.rscope_envs,
+            args.deterministic_rscope,
+            jax.random.PRNGKey(args.seed),
+            _rscope_summary_fn,
+        )
+
+        def policy_params_fn(current_step, make_policy, params):
+            del current_step
+            rscope_handle.set_make_policy(make_policy)
+            rscope_handle.dump_rollout(params)
+
+        print(
+            "rscope enabled. Run `python -m rscope` in another terminal to view rollouts."
+        )
+
+    print("\nStarting training...", flush=True)
+    print(f"[debug] jax backend: {jax.default_backend()} devices={len(jax.devices())}", flush=True)
+    print(f"[debug] env observation_size: {env.observation_size}", flush=True)
+    print(f"[debug] env action_size: {env.action_size}", flush=True)
+    print(
+        "[debug] train summary: "
+        f"run_evals={ppo_cfg.run_evals}, "
+        f"eval_env={'yes' if eval_env is not None else 'no'}, "
+        f"num_eval_envs={num_eval_envs}, "
+        f"use_pmap_on_reset={train_fn_kwargs.get('use_pmap_on_reset')}, "
+        f"normalize_observations={train_fn_kwargs.get('normalize_observations')}",
+        flush=True,
+    )
+    print(
+        f"[debug] ppo.train kwargs: {sorted(train_fn_kwargs.keys())}",
+        flush=True,
+    )
+    train_start = time.monotonic()
+    train_time = 0.0
+    try:
+        print("[debug] entering brax ppo.train() call", flush=True)
+        make_inference_fn, params, _ = train_fn(
+            environment=env,
+            progress_fn=progress,
+            policy_params_fn=policy_params_fn,
+            eval_env=eval_env,
+        )
+        print("[debug] brax ppo.train() returned", flush=True)
+        del make_inference_fn, params
+        train_time = time.monotonic() - train_start
+    finally:
+        if tb_writer is not None:
+            tb_writer.flush()
+            tb_writer.close()
+        logger.close()
+
+    print("\n" + "=" * 60)
+    print("Training Complete!")
+    print("=" * 60)
+    print(f"| Total training time: {train_time:.2f}s")
+    print(f"| Steps per second: {ppo_cfg.num_timesteps / train_time:,.0f}")
+    print(f"| Artifacts saved to: {logdir}")
+    print("=" * 60)
+
+
+def main():
+    args = _build_parser().parse_args()
+    train(args)
+
+
+if __name__ == "__main__":
+    main()
