@@ -1,0 +1,202 @@
+import functools
+import json
+import runpy
+from pathlib import Path
+from typing import Any, Dict, Optional, Union
+import jax
+import jax.numpy as jp
+from brax.training import networks as brax_networks
+from brax.training.acme import running_statistics
+from brax.training.agents.ppo import checkpoint as ppo_checkpoint
+from brax.training.agents.ppo import networks as ppo_networks
+import sys
+_REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(_REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(_REPO_ROOT))
+from jax_implementation.env import newDrone, default_config
+import mujoco
+import mujoco.viewer
+from mujoco_playground._src import mjx_env
+
+import time
+
+import numpy as np
+
+
+def _load_env_cfg_from_checkpoint(ckpt: Path):
+    ckpt = Path(ckpt).resolve()
+    env_cfg = default_config()
+    run_dir = ckpt.parent.parent
+    env_config_path = run_dir / "env_config.json"
+    ppo_config_path = run_dir / "ppo_config.json"
+
+    if not env_config_path.exists():
+        return env_cfg
+
+    loaded_env_cfg = json.loads(env_config_path.read_text())
+    for key, value in loaded_env_cfg.items():
+        current_value = env_cfg.get(key, None)
+        if isinstance(current_value, jax.Array):
+            value = jp.asarray(value, dtype=current_value.dtype)
+        env_cfg[key] = value
+
+    if ppo_config_path.exists():
+        loaded_ppo_cfg = json.loads(ppo_config_path.read_text())
+        ppo_episode_length = int(loaded_ppo_cfg["episode_length"])
+        ppo_action_repeat = int(loaded_ppo_cfg["action_repeat"])
+        if int(env_cfg.episode_length) != ppo_episode_length:
+            raise ValueError(
+                "Saved env_config and ppo_config disagree on episode_length: "
+                f"{env_cfg.episode_length} vs {ppo_episode_length}"
+            )
+        if int(env_cfg.max_steps) != ppo_episode_length:
+            raise ValueError(
+                "Saved env_config max_steps does not match ppo episode_length: "
+                f"{env_cfg.max_steps} vs {ppo_episode_length}"
+            )
+        if int(env_cfg.action_repeat) != ppo_action_repeat:
+            raise ValueError(
+                "Saved env_config and ppo_config disagree on action_repeat: "
+                f"{env_cfg.action_repeat} vs {ppo_action_repeat}"
+            )
+
+    return env_cfg
+
+
+def load_policy(ckpt: Path):
+    ns = runpy.run_path("jax_implementation/ppo/ppo_train", run_name="ppo_train_test")
+    StateObsWrapper = ns["StateObsWrapper"]
+
+    ckpt = Path(ckpt).resolve()
+    env_cfg = _load_env_cfg_from_checkpoint(ckpt)
+
+    env = StateObsWrapper(newDrone(config=env_cfg))
+    params = ppo_checkpoint.load(ckpt)
+
+    cfg = json.loads((ckpt / "ppo_network_config.json").read_text())
+    kwargs = dict(cfg["network_factory_kwargs"])
+
+    if "activation" in kwargs:
+        kwargs["activation"] = brax_networks.ACTIVATION[kwargs["activation"]]
+
+    for key in (
+        "policy_network_kernel_init_fn",
+        "value_network_kernel_init_fn",
+        "mean_kernel_init_fn",
+    ):
+        name = kwargs.get(key)
+        if name is None:
+            kwargs.pop(key, None)
+        else:
+            kwargs[key] = brax_networks.KERNEL_INITIALIZER[name]
+
+    for key in (
+        "policy_network_kernel_init_kwargs",
+        "value_network_kernel_init_kwargs",
+        "mean_kernel_init_kwargs",
+    ):
+        if kwargs.get(key) is None:
+            kwargs.pop(key, None)
+
+    network_factory = functools.partial(ppo_networks.make_ppo_networks, **kwargs)
+    normalize = running_statistics.normalize if cfg["normalize_observations"] else (lambda x, y: x)
+
+    ppo_network = network_factory(
+        env.observation_size,
+        env.action_size,
+        preprocess_observations_fn=normalize,
+    )
+    make_policy = ppo_networks.make_inference_fn(ppo_network)
+    policy = make_policy(params, deterministic=True)
+
+    return policy, env, params
+
+def _sync_viewer_data(env: newDrone, viewer_data: mujoco.MjData, state: mjx_env.State) -> None:
+    viewer_data.qpos[:] = np.asarray(state.data.qpos)
+    viewer_data.qvel[:] = np.asarray(state.data.qvel)
+    viewer_data.ctrl[:] = np.asarray(state.data.ctrl)
+    if env.mj_model.nmocap > 0:
+        viewer_data.mocap_pos[:] = np.asarray(state.data.mocap_pos)
+        viewer_data.mocap_quat[:] = np.asarray(state.data.mocap_quat)
+    mujoco.mj_forward(env.mj_model, viewer_data)
+
+def run_eval_single(
+    policy, 
+    env,
+    num_steps: int = 2000,
+    seed: int = 0,
+    render: bool = True,
+    jit_step: bool = True,
+     
+) -> None:
+    base_env = env.env if hasattr(env, "env") else env
+
+    rng = jax.random.PRNGKey(seed)
+    rng, reset_rng = jax.random.split(rng)
+    state = env.reset(reset_rng)
+
+    step_fn = jax.jit(env.step) if jit_step else env.step
+    viewer = None
+    viewer_data = None
+    if render:
+        viewer_data = mujoco.MjData(base_env.mj_model)
+        _sync_viewer_data(base_env, viewer_data, state)
+        viewer = mujoco.viewer.launch_passive(base_env.mj_model, viewer_data)
+        if base_env._track_camera_id >= 0:
+            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
+            viewer.cam.fixedcamid = base_env._track_camera_id
+            viewer.sync()
+
+
+    try:
+        for step in range(num_steps):
+            rng, action_key = jax.random.split(rng)
+            action, _ = policy(state.obs, action_key)
+            step_start = time.perf_counter()
+            state = step_fn(state, action)
+
+            if render and viewer is not None:
+                _sync_viewer_data(base_env, viewer_data, state)
+                viewer.sync()
+                if hasattr(viewer, "is_running") and not viewer.is_running():
+                    print("Viewer closed, stopping demo.")
+                    break
+
+            if step % 50 == 0:
+                dist = float(state.info["distance"])
+                pos = np.asarray(state.info["agent_location"])
+                vel = np.asarray(state.info["agent_vel"])
+                hold_streak = int(state.info["goal_hold_streak"])
+                print(
+                    f"step={step:04d} reward={float(state.reward): .3f} "
+                    f"dist={dist: .3f} hold={hold_streak:03d} "
+                    f"pos={np.round(pos, 3)} vel={np.round(vel, 3)}"
+                )
+
+            if bool(state.done):
+                print(
+                    "episode ended",
+                    f"step={step}",
+                    f"success={bool(state.info['success'])}",
+                    f"collision={bool(state.info['collision'])}",
+                    f"oob={bool(state.info['out_of_bounds'])}",
+                    f"numerical_issue={bool(state.info['numerical_issue'])}",
+                )
+                rng, reset_rng = jax.random.split(rng)
+                state = env.reset(reset_rng)
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    finally:
+        if viewer is not None:
+            viewer.close()
+
+
+if __name__ == "__main__":
+    model, env, params = load_policy("drone_training/artifacts/playground_ppo/DroneMJX-20260316-224905/checkpoints/000020234240")
+   
+    seed = int(np.random.randint(0, 1_000_000))
+    run_eval_single(model, env, 10000,seed, True, True)
+    
+    
+    

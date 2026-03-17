@@ -1,0 +1,50 @@
+<mujoco>
+  <worldbody>
+    <!-- Fixed obstacle pool parked below the arena until reset() moves them. -->
+    <body name="obstacle_0" mocap="true" pos="-3.5 0 -8">
+      <geom name="obstacle_0_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_1" mocap="true" pos="-3 0 -8">
+      <geom name="obstacle_1_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_2" mocap="true" pos="-2.5 0 -8">
+      <geom name="obstacle_2_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_3" mocap="true" pos="-2 0 -8">
+      <geom name="obstacle_3_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_4" mocap="true" pos="-1.5 0 -8">
+      <geom name="obstacle_4_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_5" mocap="true" pos="-1 0 -8">
+      <geom name="obstacle_5_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_6" mocap="true" pos="-0.5 0 -8">
+      <geom name="obstacle_6_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_7" mocap="true" pos="0 0 -8">
+      <geom name="obstacle_7_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_8" mocap="true" pos="0.5 0 -8">
+      <geom name="obstacle_8_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_9" mocap="true" pos="1 0 -8">
+      <geom name="obstacle_9_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_10" mocap="true" pos="1.5 0 -8">
+      <geom name="obstacle_10_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_11" mocap="true" pos="2 0 -8">
+      <geom name="obstacle_11_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_12" mocap="true" pos="2.5 0 -8">
+      <geom name="obstacle_12_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_13" mocap="true" pos="3 0 -8">
+      <geom name="obstacle_13_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+    <body name="obstacle_14" mocap="true" pos="3.5 0 -8">
+      <geom name="obstacle_14_geom" type="capsule" size="0.2 3" rgba="0.8 0.3 0.2 1"/>
+    </body>
+  </worldbody>
+</mujoco>

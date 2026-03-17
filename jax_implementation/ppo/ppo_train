@@ -7,6 +7,7 @@ import datetime
 import functools
 import inspect
 import json
+import shutil
 import sys
 import time
 from pathlib import Path
@@ -69,17 +70,17 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
     """PPO config tuned for stable MJX drone training."""
     return config_dict.ConfigDict(
         dict(
-            # Training timesteps - same as SB3
-            num_timesteps=20_000_000,
+         
+            num_timesteps=80_000_000,
             num_evals=20,
-            reward_scaling=0.5,
-            episode_length=2000,
+            reward_scaling=1.0,
+            episode_length=15000,
             normalize_observations=True,
             action_repeat=1,
             use_pmap_on_reset=True,
             # Smaller unroll gives more frequent policy updates.
             unroll_length=10,
-            num_minibatches=8,
+            num_minibatches=16,
             num_updates_per_batch=8,
             discounting=0.99,
             learning_rate=3e-4,
@@ -87,7 +88,7 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
             # Scaled num_envs for GPU parallelism
             num_envs=1024,
             num_eval_envs=128,
-            batch_size=1024,
+            batch_size=2048,
             max_grad_norm=1.0,
             clipping_epsilon=0.2,
             gae_lambda=0.95,
@@ -96,8 +97,8 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
             training_metrics_steps=50_000,
             network_factory=config_dict.ConfigDict(
                 dict(
-                    policy_hidden_layer_sizes=[512, 512],
-                    value_hidden_layer_sizes=[512, 512],
+                    policy_hidden_layer_sizes=[1024, 1024],
+                    value_hidden_layer_sizes=[1024, 1024],
                     policy_obs_key="state",
                     value_obs_key="state",
                 )
@@ -169,6 +170,7 @@ class StateObsWrapper(wrapper.Wrapper):
 
 
 def _build_parser() -> argparse.ArgumentParser:
+    default_ppo_cfg = _default_ppo_cfg()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--suffix", type=str, default=None)
@@ -202,45 +204,61 @@ def _build_parser() -> argparse.ArgumentParser:
     )
 
     # Training parameters - defaults aligned with SB3
-    parser.add_argument("--num_timesteps", type=int, default=20_000_000)
-    parser.add_argument("--num_evals", type=int, default=20)
-    parser.add_argument("--num_envs", type=int, default=1024)
-    parser.add_argument("--num_eval_envs", type=int, default=128)
-    parser.add_argument("--episode_length", type=int, default=2000)
-    parser.add_argument("--batch_size", type=int, default=1024)
-    parser.add_argument("--unroll_length", type=int, default=10)
-    parser.add_argument("--num_minibatches", type=int, default=8)
-    parser.add_argument("--num_updates_per_batch", type=int, default=8)
-    parser.add_argument("--learning_rate", type=float, default=3e-4)
-    parser.add_argument("--entropy_cost", type=float, default=1e-2)
-    parser.add_argument("--discounting", type=float, default=0.99)
-    parser.add_argument("--gae_lambda", type=float, default=0.95)
-    parser.add_argument("--reward_scaling", type=float, default=0.5)
-    parser.add_argument("--clipping_epsilon", type=float, default=0.2)
-    parser.add_argument("--max_grad_norm", type=float, default=1.0)
+    parser.add_argument("--num_timesteps", type=int, default=int(default_ppo_cfg.num_timesteps))
+    parser.add_argument("--num_evals", type=int, default=int(default_ppo_cfg.num_evals))
+    parser.add_argument("--num_envs", type=int, default=int(default_ppo_cfg.num_envs))
+    parser.add_argument("--num_eval_envs", type=int, default=int(default_ppo_cfg.num_eval_envs))
+    parser.add_argument("--episode_length", type=int, default=int(default_ppo_cfg.episode_length))
+    parser.add_argument("--batch_size", type=int, default=int(default_ppo_cfg.batch_size))
+    parser.add_argument("--unroll_length", type=int, default=int(default_ppo_cfg.unroll_length))
+    parser.add_argument("--num_minibatches", type=int, default=int(default_ppo_cfg.num_minibatches))
+    parser.add_argument(
+        "--num_updates_per_batch",
+        type=int,
+        default=int(default_ppo_cfg.num_updates_per_batch),
+    )
+    parser.add_argument("--learning_rate", type=float, default=float(default_ppo_cfg.learning_rate))
+    parser.add_argument("--entropy_cost", type=float, default=float(default_ppo_cfg.entropy_cost))
+    parser.add_argument("--discounting", type=float, default=float(default_ppo_cfg.discounting))
+    parser.add_argument("--gae_lambda", type=float, default=float(default_ppo_cfg.gae_lambda))
+    parser.add_argument("--reward_scaling", type=float, default=float(default_ppo_cfg.reward_scaling))
+    parser.add_argument(
+        "--clipping_epsilon",
+        type=float,
+        default=float(default_ppo_cfg.clipping_epsilon),
+    )
+    parser.add_argument("--max_grad_norm", type=float, default=float(default_ppo_cfg.max_grad_norm))
     parser.add_argument(
         "--use_pmap_on_reset",
         action=argparse.BooleanOptionalAction,
-        default=False,
+        default=bool(default_ppo_cfg.use_pmap_on_reset),
     )
     parser.add_argument(
         "--normalize_observations",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=bool(default_ppo_cfg.normalize_observations),
     )
-    parser.add_argument("--policy_obs_key", type=str, default="state")
-    parser.add_argument("--value_obs_key", type=str, default="state")
+    parser.add_argument(
+        "--policy_obs_key",
+        type=str,
+        default=str(default_ppo_cfg.network_factory.policy_obs_key),
+    )
+    parser.add_argument(
+        "--value_obs_key",
+        type=str,
+        default=str(default_ppo_cfg.network_factory.value_obs_key),
+    )
     parser.add_argument(
         "--policy_hidden_layer_sizes",
         nargs="+",
         type=int,
-        default=[512, 512],
+        default=list(default_ppo_cfg.network_factory.policy_hidden_layer_sizes),
     )
     parser.add_argument(
         "--value_hidden_layer_sizes",
         nargs="+",
         type=int,
-        default=[512, 512],
+        default=list(default_ppo_cfg.network_factory.value_hidden_layer_sizes),
     )
 
     parser.add_argument("--impl", type=str, default="jax")
@@ -365,6 +383,68 @@ def _safe_float_scalar(value: Any) -> float | None:
     except (TypeError, ValueError):
         return None
     return val if np.isfinite(val) else None
+
+
+def _validate_train_configs(
+    env_cfg: config_dict.ConfigDict,
+    ppo_cfg: config_dict.ConfigDict,
+):
+    """Ensure env/train config agreement for rollout and eval."""
+    mismatches: list[str] = []
+    env_episode_length = int(env_cfg.episode_length)
+    env_max_steps = int(env_cfg.max_steps)
+    ppo_episode_length = int(ppo_cfg.episode_length)
+    env_action_repeat = int(env_cfg.action_repeat)
+    ppo_action_repeat = int(ppo_cfg.action_repeat)
+
+    if env_episode_length != ppo_episode_length:
+        mismatches.append(
+            f"env episode_length={env_episode_length} != ppo episode_length={ppo_episode_length}"
+        )
+    if env_max_steps != ppo_episode_length:
+        mismatches.append(
+            f"env max_steps={env_max_steps} != ppo episode_length={ppo_episode_length}"
+        )
+    if env_action_repeat != ppo_action_repeat:
+        mismatches.append(
+            f"env action_repeat={env_action_repeat} != ppo action_repeat={ppo_action_repeat}"
+        )
+    if mismatches:
+        raise ValueError("Config mismatch detected:\n- " + "\n- ".join(mismatches))
+
+
+def _checkpoint_rank(metrics: dict[str, Any]) -> tuple[float, float]:
+    """Rank checkpoints by success first, then eval reward."""
+    success = _safe_float_scalar(metrics.get("eval/episode_success"))
+    reward = _safe_float_scalar(metrics.get("eval/episode_reward"))
+    return (
+        float("-inf") if success is None else success,
+        float("-inf") if reward is None else reward,
+    )
+
+
+def _save_best_checkpoint(
+    ckpt_dir: Path,
+    step: int,
+    metrics: dict[str, Any],
+    best_dir: Path,
+    best_meta_path: Path,
+):
+    """Copies the current numbered checkpoint into a stable best-checkpoint folder."""
+    src_dir = ckpt_dir / f"{step:012d}"
+    if step <= 0 or not src_dir.exists():
+        return False
+    if best_dir.exists():
+        shutil.rmtree(best_dir)
+    shutil.copytree(src_dir, best_dir)
+    best_meta = {
+        "source_step": int(step),
+        "source_checkpoint": str(src_dir),
+        "eval_reward": _safe_float_scalar(metrics.get("eval/episode_reward")),
+        "eval_success": _safe_float_scalar(metrics.get("eval/episode_success")),
+    }
+    best_meta_path.write_text(json.dumps(best_meta, indent=2), encoding="utf-8")
+    return True
 
 
 class TrainingLogger:
@@ -522,6 +602,7 @@ class TrainingLogger:
 def train(args: argparse.Namespace):
     env_cfg = _make_env_cfg(args)
     ppo_cfg = _make_ppo_cfg(args)
+    _validate_train_configs(env_cfg, ppo_cfg)
     env_cfg_json = _jsonable_config(env_cfg)
     ppo_cfg_json = _jsonable_config(ppo_cfg)
 
@@ -541,6 +622,8 @@ def train(args: argparse.Namespace):
         exp_name += f"-{args.suffix}"
     logdir = Path(args.log_root).resolve() / exp_name
     ckpt_dir = logdir / "checkpoints"
+    best_ckpt_dir = ckpt_dir / "best"
+    best_ckpt_meta_path = ckpt_dir / "best_checkpoint.json"
     tb_dir = Path(args.tensorboard_dir).resolve() if args.tensorboard_dir else (logdir / "tensorboard")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     if args.tensorboard:
@@ -656,6 +739,7 @@ def train(args: argparse.Namespace):
     first_progress_call = [True]
     progress_calls = [0]
     tb_logging_failed = [False]
+    best_checkpoint_rank = [(float("-inf"), float("-inf"))]
 
     def progress(num_steps, metrics):
         nonlocal jit_start_time, tb_writer
@@ -670,6 +754,22 @@ def train(args: argparse.Namespace):
 
         if ppo_cfg.run_evals and "eval/episode_reward" in metrics:
             logger.log_eval(num_steps, metrics)
+            candidate_rank = _checkpoint_rank(metrics)
+            if candidate_rank > best_checkpoint_rank[0]:
+                step = int(num_steps)
+                if _save_best_checkpoint(
+                    ckpt_dir=ckpt_dir,
+                    step=step,
+                    metrics=metrics,
+                    best_dir=best_ckpt_dir,
+                    best_meta_path=best_ckpt_meta_path,
+                ):
+                    best_checkpoint_rank[0] = candidate_rank
+                    print(
+                        "[debug] saved new best checkpoint "
+                        f"step={step} reward={candidate_rank[1]:.3f} success={candidate_rank[0]:.4f}",
+                        flush=True,
+                    )
         else:
             logger.log_train(num_steps, metrics)
 
