@@ -7,6 +7,7 @@ import datetime
 import functools
 import inspect
 import json
+import math
 import shutil
 import sys
 import time
@@ -71,11 +72,12 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
     return config_dict.ConfigDict(
         dict(
          
-            num_timesteps=80_000_000,
+            num_timesteps=20_000_000,
             num_evals=20,
             reward_scaling=1.0,
             episode_length=15000,
             normalize_observations=True,
+            deterministic_eval=True,
             action_repeat=1,
             use_pmap_on_reset=True,
             # Smaller unroll gives more frequent policy updates.
@@ -239,6 +241,11 @@ def _build_parser() -> argparse.ArgumentParser:
         default=bool(default_ppo_cfg.normalize_observations),
     )
     parser.add_argument(
+        "--deterministic_eval",
+        action=argparse.BooleanOptionalAction,
+        default=bool(default_ppo_cfg.deterministic_eval),
+    )
+    parser.add_argument(
         "--policy_obs_key",
         type=str,
         default=str(default_ppo_cfg.network_factory.policy_obs_key),
@@ -325,6 +332,7 @@ def _make_ppo_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
     cfg.max_grad_norm = args.max_grad_norm
     cfg.use_pmap_on_reset = args.use_pmap_on_reset
     cfg.normalize_observations = args.normalize_observations
+    cfg.deterministic_eval = args.deterministic_eval
     cfg.run_evals = args.run_evals
     cfg.log_training_metrics = args.log_training_metrics
     cfg.training_metrics_steps = args.training_metrics_steps
@@ -413,12 +421,14 @@ def _validate_train_configs(
         raise ValueError("Config mismatch detected:\n- " + "\n- ".join(mismatches))
 
 
-def _checkpoint_rank(metrics: dict[str, Any]) -> tuple[float, float]:
-    """Rank checkpoints by success first, then eval reward."""
+def _checkpoint_rank(metrics: dict[str, Any]) -> tuple[float, float, float]:
+    """Rank checkpoints by success, then final goal distance, then eval reward."""
     success = _safe_float_scalar(metrics.get("eval/episode_success"))
+    final_distance = _safe_float_scalar(metrics.get("eval/episode_final_distance_to_goal"))
     reward = _safe_float_scalar(metrics.get("eval/episode_reward"))
     return (
         float("-inf") if success is None else success,
+        float("-inf") if final_distance is None else -final_distance,
         float("-inf") if reward is None else reward,
     )
 
@@ -442,6 +452,15 @@ def _save_best_checkpoint(
         "source_checkpoint": str(src_dir),
         "eval_reward": _safe_float_scalar(metrics.get("eval/episode_reward")),
         "eval_success": _safe_float_scalar(metrics.get("eval/episode_success")),
+        "eval_final_distance_to_goal": _safe_float_scalar(
+            metrics.get("eval/episode_final_distance_to_goal")
+        ),
+        "eval_best_distance_to_goal": _safe_float_scalar(
+            metrics.get("eval/episode_best_distance_to_goal")
+        ),
+        "eval_distance_to_goal_per_step": _safe_float_scalar(
+            metrics.get("eval/episode_distance_to_goal_per_step")
+        ),
     }
     best_meta_path.write_text(json.dumps(best_meta, indent=2), encoding="utf-8")
     return True
@@ -511,6 +530,14 @@ class TrainingLogger:
         # Extract key metrics (Brax uses different keys than SB3)
         eval_reward = self._as_float(metrics.get("eval/episode_reward", 0.0))
         eval_reward_std = self._as_float(metrics.get("eval/episode_reward_std", 0.0))
+        eval_goal_dist = self._as_float(
+            metrics.get("eval/episode_final_distance_to_goal", float("nan")),
+            default=float("nan"),
+        )
+        eval_best_goal_dist = self._as_float(
+            metrics.get("eval/episode_best_distance_to_goal", float("nan")),
+            default=float("nan"),
+        )
         # Brax uses avg_episode_length, not episode_length
         eval_length = self._as_float(
             metrics.get("eval/avg_episode_length", metrics.get("eval/episode_length", 0.0))
@@ -527,6 +554,10 @@ class TrainingLogger:
         print(f"|   {'ep_len_mean':<17} | {eval_length:<20.1f} |")
         print(f"|   {'ep_rew_mean':<17} | {eval_reward:<20.3f} |")
         print(f"|   {'ep_rew_std':<17} | {eval_reward_std:<20.3f} |")
+        if not math.isnan(eval_goal_dist):
+            print(f"|   {'goal_dist_final':<17} | {eval_goal_dist:<20.3f} |")
+        if not math.isnan(eval_best_goal_dist):
+            print(f"|   {'goal_dist_best':<17} | {eval_best_goal_dist:<20.3f} |")
         print(f"| {'time/':<20} |")
         print(f"|   {'fps':<17} | {recent_fps:<20.0f} |")
         print(f"|   {'iterations':<17} | {self.eval_count:<20d} |")
@@ -739,7 +770,7 @@ def train(args: argparse.Namespace):
     first_progress_call = [True]
     progress_calls = [0]
     tb_logging_failed = [False]
-    best_checkpoint_rank = [(float("-inf"), float("-inf"))]
+    best_checkpoint_rank = [(float("-inf"), float("-inf"), float("-inf"))]
 
     def progress(num_steps, metrics):
         nonlocal jit_start_time, tb_writer
@@ -767,7 +798,8 @@ def train(args: argparse.Namespace):
                     best_checkpoint_rank[0] = candidate_rank
                     print(
                         "[debug] saved new best checkpoint "
-                        f"step={step} reward={candidate_rank[1]:.3f} success={candidate_rank[0]:.4f}",
+                        f"step={step} success={candidate_rank[0]:.4f} "
+                        f"final_dist={-candidate_rank[1]:.3f} reward={candidate_rank[2]:.3f}",
                         flush=True,
                     )
         else:

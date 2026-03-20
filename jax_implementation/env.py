@@ -55,14 +55,15 @@ def default_config() -> config_dict.ConfigDict:
         target_dist_min=2,
         target_dist_max=7,
         collision_terminate_steps=50,
-        w_progress=12.0,
+        w_progress=30.0,
         w_energy=0.01,
         w_smooth=0.02,
         w_speed=0.005,
         r_collision=10.0,
-        r_goal=100.0,
+        r_goal=500.0,
         termination_penalty=8.0,
-        eps_goal=0.5,
+        terminal_distance_penalty=20.0,
+        eps_goal=0.85,
         terminate_on_collision=True,
         # k_xy=0.45,
         # k_z=1.2,
@@ -99,7 +100,7 @@ def default_config() -> config_dict.ConfigDict:
         position_hold_epsilon=0.05,
         yaw_hold_epsilon=0.1,
         hover_speed_epsilon=0.15,
-        hover_success_steps=50,
+        hover_success_steps=25,
         landing_radius=1.5,
         landing_xy_speed=0.35,
         landing_z_speed=0.25,
@@ -182,6 +183,9 @@ class newDrone(mjx_env.MjxEnv):
             self.r_collision = float(max(0.0, float(self._config.r_collision)))
             self.r_goal = float(max(0.0, float(self._config.r_goal)))
             self.termination_penalty = float(max(0.0, float(self._config.termination_penalty)))
+            self.terminal_distance_penalty = float(
+                max(0.0, float(self._config.get("terminal_distance_penalty", 0.0)))
+            )
             self.eps_goal = float(max(0.1, float(self._config.eps_goal)))
             # self.k_xy = float(self._config.k_xy)
             # self.k_z = float(self._config.k_z)
@@ -334,6 +338,9 @@ class newDrone(mjx_env.MjxEnv):
                 max(requested_max_active, 0), self.max_obstacles
             )
             self._obstacle_mocap_ids = self._build_obstacle_mocap_ids(self._obstacle_body_names)
+            self._drone_geom_mask, self._obstacle_geom_mask = self._build_contact_geom_masks(
+                self._obstacle_body_names
+            )
             template_data = mujoco.MjData(self._mj_model)
             mujoco.mj_forward(self._mj_model, template_data)
             self._data0 = mjx.put_data(
@@ -531,6 +538,52 @@ class newDrone(mjx_env.MjxEnv):
             mocap_ids.append(mocap_id)
         return tuple(mocap_ids)
 
+    def _build_contact_geom_masks(
+        self, obstacle_body_names: tuple[str, ...]
+    ) -> tuple[jax.Array, jax.Array]:
+        geom_bodyid = np.asarray(self._mj_model.geom_bodyid, dtype=np.int32)
+        drone_geom_mask = geom_bodyid == self.body_id
+        if obstacle_body_names:
+            obstacle_body_ids = np.asarray(
+                [
+                    mujoco.mj_name2id(self._mj_model, mujoco.mjtObj.mjOBJ_BODY, body_name)
+                    for body_name in obstacle_body_names
+                ],
+                dtype=np.int32,
+            )
+            obstacle_geom_mask = np.isin(geom_bodyid, obstacle_body_ids)
+        else:
+            obstacle_geom_mask = np.zeros_like(drone_geom_mask, dtype=bool)
+        return (
+            jp.asarray(drone_geom_mask, dtype=bool),
+            jp.asarray(obstacle_geom_mask, dtype=bool),
+        )
+
+    def _detect_drone_contacts(
+        self, data: mjx.Data
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        impl = data._impl if hasattr(data, "_impl") else data
+        contact_geom = impl.contact.geom
+        contact_dist = impl.contact.dist
+        valid_contact = contact_dist <= 0.0
+        geom1 = jp.where(valid_contact, contact_geom[:, 0], 0)
+        geom2 = jp.where(valid_contact, contact_geom[:, 1], 0)
+
+        drone1 = self._drone_geom_mask[geom1]
+        drone2 = self._drone_geom_mask[geom2]
+        involves_drone = valid_contact & jp.logical_xor(drone1, drone2)
+
+        obstacle1 = self._obstacle_geom_mask[geom1]
+        obstacle2 = self._obstacle_geom_mask[geom2]
+        obstacle_contact = involves_drone & (obstacle1 | obstacle2)
+        environment_contact = involves_drone & (~(obstacle1 | obstacle2))
+
+        return (
+            jp.any(involves_drone),
+            jp.any(obstacle_contact),
+            jp.any(environment_contact),
+        )
+
     def _extract_obstacle_positions(self, data: mjx.Data) -> jax.Array:
         if self.max_obstacles == 0:
             return jp.zeros((0, 3), dtype=jp.float32)
@@ -568,7 +621,7 @@ class newDrone(mjx_env.MjxEnv):
         num_active = jax.random.randint(
             count_rng,
             (),
-            minval=0,
+            minval=7,
             maxval=self.max_active_obstacles + 1,
             dtype=jp.int32,
         )
@@ -818,6 +871,7 @@ class newDrone(mjx_env.MjxEnv):
             "sim_step": jp.array(0, dtype=jp.int32),
             "prev_distance": initial_target_distance,
             "initial_target_distance": initial_target_distance,
+            "min_distance_to_goal": initial_target_distance,
             "step": jp.array(0, dtype=jp.int32),
             "collision_streak": jp.array(0, dtype=jp.int32),
             "goal_hold_streak": jp.array(0, dtype=jp.int32),
@@ -844,6 +898,8 @@ class newDrone(mjx_env.MjxEnv):
             "success": jp.array(False),
             "hovering_at_goal": jp.array(False),
             "collision": jp.array(False),
+            "obstacle_collision": jp.array(False),
+            "environment_collision": jp.array(False),
             "collision_terminated": jp.array(False),
             "out_of_bounds": jp.array(False),
             "excessive_speed": jp.array(False),
@@ -871,8 +927,12 @@ class newDrone(mjx_env.MjxEnv):
         initial_distance: jax.Array,
     ) -> dict[str, jax.Array]:
         zero = jp.array(0.0, dtype=jp.float32)
+        dist_f32 = jp.asarray(distance, dtype=jp.float32)
         return {
-            "distance": jp.asarray(distance, dtype=jp.float32),
+            "distance": dist_f32,
+            "distance_to_goal_per_step": dist_f32,
+            "final_distance_to_goal": zero,
+            "best_distance_to_goal": zero,
             "initial_distance": jp.asarray(initial_distance, dtype=jp.float32),
             "r_prog": zero,
             "r_obs": zero,
@@ -890,6 +950,8 @@ class newDrone(mjx_env.MjxEnv):
             "success": zero,
             "hovering_at_goal": zero,
             "collision": zero,
+            "obstacle_collision": zero,
+            "environment_collision": zero,
             "collision_streak": zero,
             "goal_hold_streak": zero,
             "collision_terminated": zero,
@@ -1455,15 +1517,16 @@ class newDrone(mjx_env.MjxEnv):
             | (~jp.all(jp.isfinite(data.sensordata)))
         )
 
-        ncon = data._impl.ncon if hasattr(data, '_impl') else getattr(data, 'ncon', 0)
-        drone_z = info["agent_location"][2]
-
-        has_contact = (ncon > 0) & (drone_z < self.spawn_z_min * 0.5)
+        has_contact, has_obstacle_contact, has_environment_contact = self._detect_drone_contacts(
+            data
+        )
         reward, done, metrics, info = self._reward_and_done(
             info,
             raw_action,
             applied_action,
             has_contact,
+            has_obstacle_contact,
+            has_environment_contact,
             invalid_state,
         )
         self._last_info = info
@@ -1482,6 +1545,8 @@ class newDrone(mjx_env.MjxEnv):
         raw_action: jax.Array,
         scaled_action: jax.Array,
         has_contact: jax.Array,
+        has_obstacle_contact: jax.Array,
+        has_environment_contact: jax.Array,
         invalid_state: jax.Array,
     ):
         goal_delta = info["target"] - info["agent_location"]
@@ -1535,8 +1600,15 @@ class newDrone(mjx_env.MjxEnv):
         step_count = info["step"] + 1
         terminated = success | (self.terminate_on_collision & collision) | safety_terminated
         truncated = step_count >= self.max_steps
-        r_terminal = jp.where(terminated & (~success), -self.termination_penalty, 0.0)
+        failure_episode_end = (terminated | truncated) & (~success)
+        r_terminal = jp.where(
+            failure_episode_end,
+            -(self.termination_penalty + self.terminal_distance_penalty * dist),
+            0.0,
+        )
         reward = reward + r_terminal
+        episode_end = terminated | truncated
+        min_distance_to_goal = jp.minimum(info["min_distance_to_goal"], dist)
 
         invalid_reward = (-2.0 * self.r_collision) - self.termination_penalty
         reward = jp.where(invalid_state, invalid_reward, reward)
@@ -1546,6 +1618,8 @@ class newDrone(mjx_env.MjxEnv):
         success_i = jp.where(invalid_state, False, success)
         hovering_at_goal_i = jp.where(invalid_state, False, hovering_at_goal)
         collision_i = jp.where(invalid_state, False, has_contact)
+        obstacle_collision_i = jp.where(invalid_state, False, has_obstacle_contact)
+        environment_collision_i = jp.where(invalid_state, False, has_environment_contact)
         collision_terminated_i = jp.where(
             invalid_state, False, self.terminate_on_collision & collision
         )
@@ -1558,6 +1632,13 @@ class newDrone(mjx_env.MjxEnv):
         to_f32 = lambda x: jp.asarray(x, dtype=jp.float32)
         metrics = {
             "distance": to_f32(dist),
+            "distance_to_goal_per_step": to_f32(dist),
+            "final_distance_to_goal": to_f32(
+                jp.where(invalid_state | (~episode_end), 0.0, dist)
+            ),
+            "best_distance_to_goal": to_f32(
+                jp.where(invalid_state | (~episode_end), 0.0, min_distance_to_goal)
+            ),
             "initial_distance": to_f32(info["initial_target_distance"]),
             "r_prog": to_f32(jp.where(invalid_state, 0.0, r_prog)),
             "r_obs": to_f32(jp.where(invalid_state, 0.0, r_obs)),
@@ -1578,6 +1659,8 @@ class newDrone(mjx_env.MjxEnv):
             "success": to_f32(success_i),
             "hovering_at_goal": to_f32(hovering_at_goal_i),
             "collision": to_f32(collision_i),
+            "obstacle_collision": to_f32(obstacle_collision_i),
+            "environment_collision": to_f32(environment_collision_i),
             "collision_streak": to_f32(
                 jp.where(invalid_state, info["collision_streak"], collision_streak)
             ),
@@ -1601,6 +1684,9 @@ class newDrone(mjx_env.MjxEnv):
                 scaled_action,
             ),
             "prev_distance": jp.where(invalid_state, info["prev_distance"], dist),
+            "min_distance_to_goal": jp.where(
+                invalid_state, info["min_distance_to_goal"], min_distance_to_goal
+            ),
             "step": step_count,
             "collision_streak": jp.where(invalid_state, info["collision_streak"], collision_streak),
             "goal_hold_streak": jp.where(
@@ -1630,6 +1716,8 @@ class newDrone(mjx_env.MjxEnv):
             "success": success_i,
             "hovering_at_goal": hovering_at_goal_i,
             "collision": collision_i,
+            "obstacle_collision": obstacle_collision_i,
+            "environment_collision": environment_collision_i,
             "collision_terminated": collision_terminated_i,
             "out_of_bounds": out_of_bounds_i,
             "excessive_speed": excessive_speed_i,

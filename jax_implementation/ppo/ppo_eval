@@ -193,7 +193,7 @@ def run_eval_single(
 
 
 if __name__ == "__main__":
-    model, env, params = load_policy("drone_training/artifacts/playground_ppo/DroneMJX-20260316-224905/checkpoints/000020234240")
+    model, env, params = load_policy("drone_training/artifacts/playground_ppo/DroneMJX-20260317-093454/checkpoints/000034078720")
    
     seed = int(np.random.randint(0, 1_000_000))
     run_eval_single(model, env, 10000,seed, True, True)
