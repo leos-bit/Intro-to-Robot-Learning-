@@ -1,4 +1,4 @@
-"""Train Drone_env (MJX) with MuJoCo Playground PPO and optional rscope dumps."""
+"""Train Drone_env (MJX) with Brax SAC and optional logging/checkpointing."""
 
 from __future__ import annotations
 
@@ -14,8 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from brax.training.agents.ppo import networks as ppo_networks
-from brax.training.agents.ppo import train as ppo
+from brax.training.agents.sac import networks as sac_networks
+from brax.training.agents.sac import train as sac
 import jax
 import jax.numpy as jp
 from ml_collections import config_dict
@@ -67,42 +67,32 @@ def _canonicalize_model_assets(assets: dict[str, bytes]) -> dict[str, bytes]:
     return {key: content for key, content in (chosen[b] for b in sorted(chosen))}
 
 
-def _default_ppo_cfg() -> config_dict.ConfigDict:
-    """PPO config tuned for stable MJX drone training."""
+def _default_sac_cfg() -> config_dict.ConfigDict:
+    """SAC config tuned for stable MJX drone training."""
     return config_dict.ConfigDict(
         dict(
-         
             num_timesteps=20_000_000,
             num_evals=20,
             reward_scaling=1.0,
             episode_length=15000,
             normalize_observations=True,
-            deterministic_eval=False,
+            deterministic_eval=True,
             action_repeat=1,
-            use_pmap_on_reset=True,
-            # Smaller unroll gives more frequent policy updates.
-            unroll_length=10,
-            num_minibatches=16,
-            num_updates_per_batch=8,
             discounting=0.99,
             learning_rate=3e-4,
-            entropy_cost=1e-2,
-            # Scaled num_envs for GPU parallelism
             num_envs=1024,
             num_eval_envs=128,
             batch_size=2048,
-            max_grad_norm=1.0,
-            clipping_epsilon=0.2,
-            gae_lambda=0.95,
+            tau=0.005,
+            min_replay_size=65_536,
+            max_replay_size=1_000_000,
+            grad_updates_per_step=1,
             run_evals=True,
-            log_training_metrics=True,
-            training_metrics_steps=50_000,
             network_factory=config_dict.ConfigDict(
                 dict(
-                    policy_hidden_layer_sizes=[1024, 1024],
-                    value_hidden_layer_sizes=[1024, 1024],
-                    policy_obs_key="state",
-                    value_obs_key="state",
+                    hidden_layer_sizes=[1024, 1024],
+                    policy_network_layer_norm=False,
+                    q_network_layer_norm=False,
                 )
             ),
         )
@@ -110,7 +100,7 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
 
 
 class StateObsWrapper(wrapper.Wrapper):
-    """Convert dict observations from Drone_env into a single 'state' vector."""
+    """Convert dict observations from Drone_env into a single flat vector."""
 
     def __init__(self, env: mjx_env.MjxEnv):
         super().__init__(env)
@@ -149,14 +139,13 @@ class StateObsWrapper(wrapper.Wrapper):
                     int(np.prod(obs_size)) if isinstance(obs_size, tuple) else int(obs_size)
                 )
 
-    def _pack_obs(self, obs: dict[str, jax.Array]) -> dict[str, jax.Array]:
+    def _pack_obs(self, obs: dict[str, jax.Array]) -> jax.Array:
         # Flatten each observation block so mixed shapes like obstacle_rel [N, 3]
-        # still pack into one PPO-ready state vector.
-        state = jp.concatenate(
+        # still pack into one SAC-ready state vector.
+        return jp.concatenate(
             [jp.asarray(obs[k], dtype=jp.float32).reshape((-1,)) for k in self._obs_keys],
             axis=-1,
         )
-        return {"state": state}
 
     def reset(self, rng: jax.Array) -> mjx_env.State:
         state = self.env.reset(rng)
@@ -168,11 +157,11 @@ class StateObsWrapper(wrapper.Wrapper):
 
     @property
     def observation_size(self):
-        return {"state": (self._state_size,)}
+        return self._state_size
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    default_ppo_cfg = _default_ppo_cfg()
+    default_sac_cfg = _default_sac_cfg()
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--suffix", type=str, default=None)
@@ -192,80 +181,39 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--load_checkpoint_path", type=str, default=None)
     parser.add_argument("--run_evals", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--progress_bar", action=argparse.BooleanOptionalAction, default=True)
+    # Training parameters
+    parser.add_argument("--num_timesteps", type=int, default=int(default_sac_cfg.num_timesteps))
+    parser.add_argument("--num_evals", type=int, default=int(default_sac_cfg.num_evals))
+    parser.add_argument("--num_envs", type=int, default=int(default_sac_cfg.num_envs))
+    parser.add_argument("--num_eval_envs", type=int, default=int(default_sac_cfg.num_eval_envs))
+    parser.add_argument("--episode_length", type=int, default=int(default_sac_cfg.episode_length))
+    parser.add_argument("--batch_size", type=int, default=int(default_sac_cfg.batch_size))
+    parser.add_argument("--learning_rate", type=float, default=float(default_sac_cfg.learning_rate))
+    parser.add_argument("--discounting", type=float, default=float(default_sac_cfg.discounting))
+    parser.add_argument("--reward_scaling", type=float, default=float(default_sac_cfg.reward_scaling))
+    parser.add_argument("--tau", type=float, default=float(default_sac_cfg.tau))
+    parser.add_argument("--min_replay_size", type=int, default=int(default_sac_cfg.min_replay_size))
+    parser.add_argument("--max_replay_size", type=int, default=int(default_sac_cfg.max_replay_size))
     parser.add_argument(
-        "--log_training_metrics",
-        action=argparse.BooleanOptionalAction,
-        default=True,
-        help="Request periodic training loss metrics from Brax PPO (if supported).",
-    )
-    parser.add_argument(
-        "--training_metrics_steps",
+        "--grad_updates_per_step",
         type=int,
-        default=50_000,
-        help="Emit training metrics every N env steps (if supported).",
-    )
-
-    # Training parameters - defaults aligned with SB3
-    parser.add_argument("--num_timesteps", type=int, default=int(default_ppo_cfg.num_timesteps))
-    parser.add_argument("--num_evals", type=int, default=int(default_ppo_cfg.num_evals))
-    parser.add_argument("--num_envs", type=int, default=int(default_ppo_cfg.num_envs))
-    parser.add_argument("--num_eval_envs", type=int, default=int(default_ppo_cfg.num_eval_envs))
-    parser.add_argument("--episode_length", type=int, default=int(default_ppo_cfg.episode_length))
-    parser.add_argument("--batch_size", type=int, default=int(default_ppo_cfg.batch_size))
-    parser.add_argument("--unroll_length", type=int, default=int(default_ppo_cfg.unroll_length))
-    parser.add_argument("--num_minibatches", type=int, default=int(default_ppo_cfg.num_minibatches))
-    parser.add_argument(
-        "--num_updates_per_batch",
-        type=int,
-        default=int(default_ppo_cfg.num_updates_per_batch),
-    )
-    parser.add_argument("--learning_rate", type=float, default=float(default_ppo_cfg.learning_rate))
-    parser.add_argument("--entropy_cost", type=float, default=float(default_ppo_cfg.entropy_cost))
-    parser.add_argument("--discounting", type=float, default=float(default_ppo_cfg.discounting))
-    parser.add_argument("--gae_lambda", type=float, default=float(default_ppo_cfg.gae_lambda))
-    parser.add_argument("--reward_scaling", type=float, default=float(default_ppo_cfg.reward_scaling))
-    parser.add_argument(
-        "--clipping_epsilon",
-        type=float,
-        default=float(default_ppo_cfg.clipping_epsilon),
-    )
-    parser.add_argument("--max_grad_norm", type=float, default=float(default_ppo_cfg.max_grad_norm))
-    parser.add_argument(
-        "--use_pmap_on_reset",
-        action=argparse.BooleanOptionalAction,
-        default=bool(default_ppo_cfg.use_pmap_on_reset),
+        default=int(default_sac_cfg.grad_updates_per_step),
     )
     parser.add_argument(
         "--normalize_observations",
         action=argparse.BooleanOptionalAction,
-        default=bool(default_ppo_cfg.normalize_observations),
+        default=bool(default_sac_cfg.normalize_observations),
     )
     parser.add_argument(
         "--deterministic_eval",
         action=argparse.BooleanOptionalAction,
-        default=bool(default_ppo_cfg.deterministic_eval),
+        default=bool(default_sac_cfg.deterministic_eval),
     )
     parser.add_argument(
-        "--policy_obs_key",
-        type=str,
-        default=str(default_ppo_cfg.network_factory.policy_obs_key),
-    )
-    parser.add_argument(
-        "--value_obs_key",
-        type=str,
-        default=str(default_ppo_cfg.network_factory.value_obs_key),
-    )
-    parser.add_argument(
-        "--policy_hidden_layer_sizes",
+        "--hidden_layer_sizes",
         nargs="+",
         type=int,
-        default=list(default_ppo_cfg.network_factory.policy_hidden_layer_sizes),
-    )
-    parser.add_argument(
-        "--value_hidden_layer_sizes",
-        nargs="+",
-        type=int,
-        default=list(default_ppo_cfg.network_factory.value_hidden_layer_sizes),
+        default=list(default_sac_cfg.network_factory.hidden_layer_sizes),
     )
 
     parser.add_argument("--impl", type=str, default="jax")
@@ -312,34 +260,25 @@ def _make_env_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
     return env_cfg
 
 
-def _make_ppo_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
-    cfg = _default_ppo_cfg()
+def _make_sac_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
+    cfg = _default_sac_cfg()
     cfg.num_timesteps = args.num_timesteps
     cfg.num_evals = args.num_evals
     cfg.num_envs = args.num_envs
     cfg.num_eval_envs = args.num_eval_envs
     cfg.episode_length = args.episode_length
     cfg.batch_size = args.batch_size
-    cfg.unroll_length = args.unroll_length
-    cfg.num_minibatches = args.num_minibatches
-    cfg.num_updates_per_batch = args.num_updates_per_batch
     cfg.learning_rate = args.learning_rate
-    cfg.entropy_cost = args.entropy_cost
     cfg.discounting = args.discounting
-    cfg.gae_lambda = args.gae_lambda
     cfg.reward_scaling = args.reward_scaling
-    cfg.clipping_epsilon = args.clipping_epsilon
-    cfg.max_grad_norm = args.max_grad_norm
-    cfg.use_pmap_on_reset = args.use_pmap_on_reset
+    cfg.tau = args.tau
+    cfg.min_replay_size = args.min_replay_size
+    cfg.max_replay_size = args.max_replay_size
+    cfg.grad_updates_per_step = args.grad_updates_per_step
     cfg.normalize_observations = args.normalize_observations
     cfg.deterministic_eval = args.deterministic_eval
     cfg.run_evals = args.run_evals
-    cfg.log_training_metrics = args.log_training_metrics
-    cfg.training_metrics_steps = args.training_metrics_steps
-    cfg.network_factory.policy_hidden_layer_sizes = list(args.policy_hidden_layer_sizes)
-    cfg.network_factory.value_hidden_layer_sizes = list(args.value_hidden_layer_sizes)
-    cfg.network_factory.policy_obs_key = args.policy_obs_key
-    cfg.network_factory.value_obs_key = args.value_obs_key
+    cfg.network_factory.hidden_layer_sizes = list(args.hidden_layer_sizes)
     return cfg
 
 
@@ -395,27 +334,27 @@ def _safe_float_scalar(value: Any) -> float | None:
 
 def _validate_train_configs(
     env_cfg: config_dict.ConfigDict,
-    ppo_cfg: config_dict.ConfigDict,
+    sac_cfg: config_dict.ConfigDict,
 ):
     """Ensure env/train config agreement for rollout and eval."""
     mismatches: list[str] = []
     env_episode_length = int(env_cfg.episode_length)
     env_max_steps = int(env_cfg.max_steps)
-    ppo_episode_length = int(ppo_cfg.episode_length)
+    sac_episode_length = int(sac_cfg.episode_length)
     env_action_repeat = int(env_cfg.action_repeat)
-    ppo_action_repeat = int(ppo_cfg.action_repeat)
+    sac_action_repeat = int(sac_cfg.action_repeat)
 
-    if env_episode_length != ppo_episode_length:
+    if env_episode_length != sac_episode_length:
         mismatches.append(
-            f"env episode_length={env_episode_length} != ppo episode_length={ppo_episode_length}"
+            f"env episode_length={env_episode_length} != sac episode_length={sac_episode_length}"
         )
-    if env_max_steps != ppo_episode_length:
+    if env_max_steps != sac_episode_length:
         mismatches.append(
-            f"env max_steps={env_max_steps} != ppo episode_length={ppo_episode_length}"
+            f"env max_steps={env_max_steps} != sac episode_length={sac_episode_length}"
         )
-    if env_action_repeat != ppo_action_repeat:
+    if env_action_repeat != sac_action_repeat:
         mismatches.append(
-            f"env action_repeat={env_action_repeat} != ppo action_repeat={ppo_action_repeat}"
+            f"env action_repeat={env_action_repeat} != sac action_repeat={sac_action_repeat}"
         )
     if mismatches:
         raise ValueError("Config mismatch detected:\n- " + "\n- ".join(mismatches))
@@ -564,30 +503,31 @@ class TrainingLogger:
         print(f"|   {'time_elapsed':<17} | {elapsed:<20.0f} |")
         print(f"|   {'total_timesteps':<17} | {num_steps_int:<20d} |")
 
-        # Log training metrics if available
-        train_reward = self._as_float(
-            metrics.get("training/episode_reward", metrics.get("episode/sum_reward")),
-            default=float("nan"),
-        )
-        if np.isfinite(train_reward):
-            print(f"| {'train/':<20} |")
-            print(f"|   {'reward':<17} | {train_reward:<20.3f} |")
-
         # Log additional metrics
-        if "training/entropy_loss" in metrics:
+        if "training/actor_loss" in metrics:
             print(
-                f"|   {'entropy_loss':<17} | "
-                f"{self._as_float(metrics['training/entropy_loss']):<20.4f} |"
+                f"|   {'actor_loss':<17} | "
+                f"{self._as_float(metrics['training/actor_loss']):<20.4f} |"
             )
-        if "training/policy_loss" in metrics:
+        if "training/critic_loss" in metrics:
             print(
-                f"|   {'policy_loss':<17} | "
-                f"{self._as_float(metrics['training/policy_loss']):<20.4f} |"
+                f"|   {'critic_loss':<17} | "
+                f"{self._as_float(metrics['training/critic_loss']):<20.4f} |"
             )
-        if "training/value_loss" in metrics:
+        if "training/alpha_loss" in metrics:
             print(
-                f"|   {'value_loss':<17} | "
-                f"{self._as_float(metrics['training/value_loss']):<20.4f} |"
+                f"|   {'alpha_loss':<17} | "
+                f"{self._as_float(metrics['training/alpha_loss']):<20.4f} |"
+            )
+        if "training/alpha" in metrics:
+            print(
+                f"|   {'alpha':<17} | "
+                f"{self._as_float(metrics['training/alpha']):<20.4f} |"
+            )
+        if "training/buffer_current_size" in metrics:
+            print(
+                f"|   {'buffer_size':<17} | "
+                f"{self._as_float(metrics['training/buffer_current_size']):<20.0f} |"
             )
 
         print("-" * 60)
@@ -607,12 +547,9 @@ class TrainingLogger:
         if self.pbar is not None:
             self.pbar.n = num_steps_int
             # Show training reward in progress bar if available
-            train_reward = self._as_float(
-                metrics.get("episode/sum_reward", metrics.get("training/episode_reward")),
-                default=float("nan"),
-            )
+            train_reward = self._as_float(metrics.get("training/actor_loss"), default=float("nan"))
             if np.isfinite(train_reward):
-                self.pbar.set_postfix({"train_rew": f"{train_reward:.2f}"}, refresh=True)
+                self.pbar.set_postfix({"actor_loss": f"{train_reward:.2f}"}, refresh=True)
             else:
                 self.pbar.refresh()
 
@@ -632,17 +569,17 @@ class TrainingLogger:
 
 def train(args: argparse.Namespace):
     env_cfg = _make_env_cfg(args)
-    ppo_cfg = _make_ppo_cfg(args)
-    _validate_train_configs(env_cfg, ppo_cfg)
+    sac_cfg = _make_sac_cfg(args)
+    _validate_train_configs(env_cfg, sac_cfg)
     env_cfg_json = _jsonable_config(env_cfg)
-    ppo_cfg_json = _jsonable_config(ppo_cfg)
+    sac_cfg_json = _jsonable_config(sac_cfg)
 
     env_base = newDrone(config=env_cfg)
     canonical_assets = _canonicalize_model_assets(env_base.model_assets)
     env_base._model_assets = canonical_assets
     env = StateObsWrapper(env_base)
     eval_env = None
-    if ppo_cfg.run_evals:
+    if sac_cfg.run_evals:
         eval_env_base = newDrone(config=env_cfg)
         eval_env_base._model_assets = canonical_assets
         eval_env = StateObsWrapper(eval_env_base)
@@ -662,8 +599,8 @@ def train(args: argparse.Namespace):
 
     with (logdir / "env_config.json").open("w", encoding="utf-8") as fp:
         json.dump(env_cfg_json, fp, indent=2)
-    with (logdir / "ppo_config.json").open("w", encoding="utf-8") as fp:
-        json.dump(ppo_cfg_json, fp, indent=2)
+    with (logdir / "sac_config.json").open("w", encoding="utf-8") as fp:
+        json.dump(sac_cfg_json, fp, indent=2)
 
     # SB3-style header
     print("=" * 60)
@@ -673,23 +610,20 @@ def train(args: argparse.Namespace):
     if args.tensorboard:
         print(f"| TensorBoard dir: {tb_dir}")
     print("=" * 60)
-    print("| PPO Hyperparameters:")
-    print(f"|   num_timesteps: {ppo_cfg.num_timesteps:,}")
-    print(f"|   num_envs: {ppo_cfg.num_envs}")
-    print(f"|   episode_length: {ppo_cfg.episode_length}")
-    print(f"|   learning_rate: {ppo_cfg.learning_rate}")
-    print(f"|   discounting (gamma): {ppo_cfg.discounting}")
-    print(f"|   gae_lambda: {ppo_cfg.gae_lambda}")
-    print(f"|   entropy_cost: {ppo_cfg.entropy_cost}")
-    print(f"|   clipping_epsilon: {ppo_cfg.clipping_epsilon}")
-    print(f"|   unroll_length: {ppo_cfg.unroll_length}")
-    print(f"|   num_minibatches: {ppo_cfg.num_minibatches}")
-    print(f"|   num_updates_per_batch: {ppo_cfg.num_updates_per_batch}")
-    print(f"|   use_pmap_on_reset: {ppo_cfg.use_pmap_on_reset}")
-    print(f"|   log_training_metrics: {ppo_cfg.log_training_metrics}")
-    print(f"|   training_metrics_steps: {ppo_cfg.training_metrics_steps}")
-    print(f"|   policy_hidden_layers: {ppo_cfg.network_factory.policy_hidden_layer_sizes}")
-    print(f"|   value_hidden_layers: {ppo_cfg.network_factory.value_hidden_layer_sizes}")
+    print("| SAC Hyperparameters:")
+    print(f"|   num_timesteps: {sac_cfg.num_timesteps:,}")
+    print(f"|   num_envs: {sac_cfg.num_envs}")
+    print(f"|   episode_length: {sac_cfg.episode_length}")
+    print(f"|   learning_rate: {sac_cfg.learning_rate}")
+    print(f"|   discounting (gamma): {sac_cfg.discounting}")
+    print(f"|   reward_scaling: {sac_cfg.reward_scaling}")
+    print(f"|   tau: {sac_cfg.tau}")
+    print(f"|   batch_size: {sac_cfg.batch_size}")
+    print(f"|   min_replay_size: {sac_cfg.min_replay_size}")
+    print(f"|   max_replay_size: {sac_cfg.max_replay_size}")
+    print(f"|   grad_updates_per_step: {sac_cfg.grad_updates_per_step}")
+    print(f"|   deterministic_eval: {sac_cfg.deterministic_eval}")
+    print(f"|   hidden_layers: {sac_cfg.network_factory.hidden_layer_sizes}")
     print("=" * 60)
     print("| Environment Config:")
     print(f"|   action_scale: {env_cfg.action_scale}")
@@ -703,14 +637,15 @@ def train(args: argparse.Namespace):
     print(f"|   w_speed: {env_cfg.w_speed}")
     print("=" * 60)
 
-    training_params: dict[str, Any] = dict(ppo_cfg)
+    training_params: dict[str, Any] = dict(sac_cfg)
     network_factory_cfg = dict(training_params.pop("network_factory"))
     # Keep num_eval_envs separate so we can pass it conditionally.
-    num_eval_envs = int(training_params.pop("num_eval_envs", ppo_cfg.num_eval_envs))
+    num_eval_envs = int(training_params.pop("num_eval_envs", sac_cfg.num_eval_envs))
+    training_params.pop("run_evals", None)
 
     # Filter kwargs by installed Brax signature so train-loss metrics are passed when supported.
     try:
-        train_sig = inspect.signature(ppo.train)
+        train_sig = inspect.signature(sac.train)
         supported_train_args = set(train_sig.parameters.keys())
     except Exception:
         supported_train_args = set()
@@ -721,13 +656,18 @@ def train(args: argparse.Namespace):
             del training_params[key]
     if dropped_args:
         print(
-            "Dropping unsupported ppo.train args for this Brax version: "
+            "Dropping unsupported sac.train args for this Brax version: "
             + ", ".join(sorted(dropped_args))
         )
 
+    hidden_layer_sizes = tuple(network_factory_cfg.get("hidden_layer_sizes", (1024, 1024)))
     network_factory = functools.partial(
-        ppo_networks.make_ppo_networks,
-        **network_factory_cfg,
+        sac_networks.make_sac_networks,
+        hidden_layer_sizes=hidden_layer_sizes,
+        policy_network_layer_norm=bool(
+            network_factory_cfg.get("policy_network_layer_norm", False)
+        ),
+        q_network_layer_norm=bool(network_factory_cfg.get("q_network_layer_norm", False)),
     )
 
     restore_checkpoint_path = None
@@ -740,18 +680,18 @@ def train(args: argparse.Namespace):
         network_factory=network_factory,
         seed=args.seed,
         restore_checkpoint_path=restore_checkpoint_path,
-        save_checkpoint_path=str(ckpt_dir),
+        checkpoint_logdir=str(ckpt_dir),
         wrap_env_fn=wrapper.wrap_for_brax_training,
     )
     if (not supported_train_args) or ("num_eval_envs" in supported_train_args):
         train_fn_kwargs["num_eval_envs"] = num_eval_envs
-    train_fn = functools.partial(ppo.train, **train_fn_kwargs)
+    train_fn = functools.partial(sac.train, **train_fn_kwargs)
 
     # Initialize logger with progress bar
     logger = TrainingLogger(
-        total_timesteps=ppo_cfg.num_timesteps,
-        num_envs=ppo_cfg.num_envs,
-        episode_length=ppo_cfg.episode_length,
+        total_timesteps=sac_cfg.num_timesteps,
+        num_envs=sac_cfg.num_envs,
+        episode_length=sac_cfg.episode_length,
         use_progress_bar=args.progress_bar,
     )
     tb_writer = None
@@ -764,7 +704,7 @@ def train(args: argparse.Namespace):
             tb_writer.add_text("run/experiment", exp_name, 0)
             tb_writer.add_text("run/logdir", str(logdir), 0)
             tb_writer.add_text("run/env_config", json.dumps(env_cfg_json, indent=2), 0)
-            tb_writer.add_text("run/ppo_config", json.dumps(ppo_cfg_json, indent=2), 0)
+            tb_writer.add_text("run/sac_config", json.dumps(sac_cfg_json, indent=2), 0)
 
     jit_start_time = time.monotonic()
     first_progress_call = [True]
@@ -783,7 +723,7 @@ def train(args: argparse.Namespace):
                 tb_writer.add_scalar("time/jit_compile_seconds", jit_time, int(num_steps))
             first_progress_call[0] = False
 
-        if ppo_cfg.run_evals and "eval/episode_reward" in metrics:
+        if sac_cfg.run_evals and "eval/episode_reward" in metrics:
             logger.log_eval(num_steps, metrics)
             candidate_rank = _checkpoint_rank(metrics)
             if candidate_rank > best_checkpoint_rank[0]:
@@ -835,13 +775,11 @@ def train(args: argparse.Namespace):
                     tb_writer.add_scalar("eval_reward/episode_reward", eval_reward, step)
                 # Duplicate common loss keys under a stable namespace for quick filtering.
                 loss_tag_map = {
-                    "training/policy_loss": "train_loss/policy_loss",
-                    "training/value_loss": "train_loss/value_loss",
-                    "training/entropy_loss": "train_loss/entropy_loss",
-                    "training/total_loss": "train_loss/total_loss",
-                    "training/approx_kl": "train_loss/approx_kl",
-                    "training/clip_fraction": "train_loss/clip_fraction",
-                    "training/learning_rate": "train_loss/learning_rate",
+                    "training/actor_loss": "train_loss/actor_loss",
+                    "training/critic_loss": "train_loss/critic_loss",
+                    "training/alpha_loss": "train_loss/alpha_loss",
+                    "training/alpha": "train_loss/alpha",
+                    "training/buffer_current_size": "train_misc/buffer_current_size",
                 }
                 for src_key, dst_key in loss_tag_map.items():
                     if src_key not in metrics:
@@ -859,40 +797,10 @@ def train(args: argparse.Namespace):
                     tb_logging_failed[0] = True
                 tb_writer = None
 
-    policy_params_fn = lambda *unused: None
     if args.rscope_envs > 0:
-        try:
-            from rscope import brax as rscope_utils
-        except ImportError as exc:
-            raise ImportError(
-                "rscope is required when --rscope_envs > 0. Install with `pip install rscope`."
-            ) from exc
-
-        rscope_env = wrapper.wrap_for_brax_training(
-            StateObsWrapper(newDrone(config=env_cfg)),
-            episode_length=ppo_cfg.episode_length,
-            action_repeat=ppo_cfg.action_repeat,
-        )
-        # Wrapper inherits MjxEnv.model_assets but does not forward it to inner env.
-        # rscope expects trace_env.model_assets to exist.
-        rscope_env._model_assets = canonical_assets
-        rscope_handle = rscope_utils.BraxRolloutSaver(
-            rscope_env,
-            ppo_cfg,
-            False,  # vision
-            args.rscope_envs,
-            args.deterministic_rscope,
-            jax.random.PRNGKey(args.seed),
-            _rscope_summary_fn,
-        )
-
-        def policy_params_fn(current_step, make_policy, params):
-            del current_step
-            rscope_handle.set_make_policy(make_policy)
-            rscope_handle.dump_rollout(params)
-
-        print(
-            "rscope enabled. Run `python -m rscope` in another terminal to view rollouts."
+        raise NotImplementedError(
+            "rscope rollouts are not supported in train_sac.py because Brax SAC "
+            "does not expose the PPO-style policy_params_fn callback."
         )
 
     print("\nStarting training...", flush=True)
@@ -901,28 +809,27 @@ def train(args: argparse.Namespace):
     print(f"[debug] env action_size: {env.action_size}", flush=True)
     print(
         "[debug] train summary: "
-        f"run_evals={ppo_cfg.run_evals}, "
+        f"run_evals={sac_cfg.run_evals}, "
         f"eval_env={'yes' if eval_env is not None else 'no'}, "
         f"num_eval_envs={num_eval_envs}, "
-        f"use_pmap_on_reset={train_fn_kwargs.get('use_pmap_on_reset')}, "
+        f"deterministic_eval={train_fn_kwargs.get('deterministic_eval')}, "
         f"normalize_observations={train_fn_kwargs.get('normalize_observations')}",
         flush=True,
     )
     print(
-        f"[debug] ppo.train kwargs: {sorted(train_fn_kwargs.keys())}",
+        f"[debug] sac.train kwargs: {sorted(train_fn_kwargs.keys())}",
         flush=True,
     )
     train_start = time.monotonic()
     train_time = 0.0
     try:
-        print("[debug] entering brax ppo.train() call", flush=True)
+        print("[debug] entering brax sac.train() call", flush=True)
         make_inference_fn, params, _ = train_fn(
             environment=env,
             progress_fn=progress,
-            policy_params_fn=policy_params_fn,
             eval_env=eval_env,
         )
-        print("[debug] brax ppo.train() returned", flush=True)
+        print("[debug] brax sac.train() returned", flush=True)
         del make_inference_fn, params
         train_time = time.monotonic() - train_start
     finally:
@@ -935,7 +842,7 @@ def train(args: argparse.Namespace):
     print("Training Complete!")
     print("=" * 60)
     print(f"| Total training time: {train_time:.2f}s")
-    print(f"| Steps per second: {ppo_cfg.num_timesteps / train_time:,.0f}")
+    print(f"| Steps per second: {sac_cfg.num_timesteps / train_time:,.0f}")
     print(f"| Artifacts saved to: {logdir}")
     print("=" * 60)
 
