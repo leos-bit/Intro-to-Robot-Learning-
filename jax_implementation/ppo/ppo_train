@@ -77,7 +77,6 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
             reward_scaling=1.0,
             episode_length=15000,
             normalize_observations=True,
-            deterministic_eval=False,
             action_repeat=1,
             use_pmap_on_reset=True,
             # Smaller unroll gives more frequent policy updates.
@@ -241,11 +240,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=bool(default_ppo_cfg.normalize_observations),
     )
     parser.add_argument(
-        "--deterministic_eval",
-        action=argparse.BooleanOptionalAction,
-        default=bool(default_ppo_cfg.deterministic_eval),
-    )
-    parser.add_argument(
         "--policy_obs_key",
         type=str,
         default=str(default_ppo_cfg.network_factory.policy_obs_key),
@@ -332,7 +326,6 @@ def _make_ppo_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
     cfg.max_grad_norm = args.max_grad_norm
     cfg.use_pmap_on_reset = args.use_pmap_on_reset
     cfg.normalize_observations = args.normalize_observations
-    cfg.deterministic_eval = args.deterministic_eval
     cfg.run_evals = args.run_evals
     cfg.log_training_metrics = args.log_training_metrics
     cfg.training_metrics_steps = args.training_metrics_steps
