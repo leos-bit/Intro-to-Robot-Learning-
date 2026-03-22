@@ -74,7 +74,7 @@ def _default_sac_cfg() -> config_dict.ConfigDict:
             num_timesteps=20_000_000,
             num_evals=20,
             reward_scaling=1.0,
-            episode_length=15000,
+            episode_length=5000,
             normalize_observations=True,
             deterministic_eval=True,
             action_repeat=1,

@@ -72,10 +72,10 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
     return config_dict.ConfigDict(
         dict(
          
-            num_timesteps=20_000_000,
+            num_timesteps=60_000_000,
             num_evals=20,
             reward_scaling=1.0,
-            episode_length=15000,
+            episode_length=5000,
             normalize_observations=True,
             action_repeat=1,
             use_pmap_on_reset=True,
@@ -98,8 +98,8 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
             training_metrics_steps=50_000,
             network_factory=config_dict.ConfigDict(
                 dict(
-                    policy_hidden_layer_sizes=[1024, 1024],
-                    value_hidden_layer_sizes=[1024, 1024],
+                    policy_hidden_layer_sizes=[512, 512],
+                    value_hidden_layer_sizes=[512, 512],
                     policy_obs_key="state",
                     value_obs_key="state",
                 )
