@@ -56,6 +56,10 @@ def default_config() -> config_dict.ConfigDict:
         target_dist_max=7,
         collision_terminate_steps=50,
         w_progress=30.0,
+        w_goal_proximity=0.3,
+        goal_proximity_scale=2.5,
+        w_goal_best_progress=20.0,
+        w_goal_hover=1.0,
         w_energy=0.01,
         w_smooth=0.02,
         w_speed=0.005,
@@ -177,6 +181,18 @@ class newDrone(mjx_env.MjxEnv):
             self.terminate_on_collision = bool(self._config.terminate_on_collision)
             self.collision_terminate_steps = max(1, int(self._config.collision_terminate_steps))
             self.w_progress = float(self._config.w_progress)
+            self.w_goal_proximity = float(
+                max(0.0, float(self._config.get("w_goal_proximity", 0.0)))
+            )
+            self.goal_proximity_scale = float(
+                max(0.1, float(self._config.get("goal_proximity_scale", 1.0)))
+            )
+            self.w_goal_best_progress = float(
+                max(0.0, float(self._config.get("w_goal_best_progress", 0.0)))
+            )
+            self.w_goal_hover = float(
+                max(0.0, float(self._config.get("w_goal_hover", 0.0)))
+            )
             self.w_energy = float(max(0.0, float(self._config.w_energy)))
             self.w_smooth = float(max(0.0, float(self._config.w_smooth)))
             self.w_speed = float(max(0.0, float(self._config.w_speed)))
@@ -621,7 +637,7 @@ class newDrone(mjx_env.MjxEnv):
         num_active = jax.random.randint(
             count_rng,
             (),
-            minval=7,
+            minval=1,
             maxval=self.max_active_obstacles + 1,
             dtype=jp.int32,
         )
@@ -886,6 +902,9 @@ class newDrone(mjx_env.MjxEnv):
             "lidar_clearance": lidar_clearance,
             "true_obstacle_clearance": true_obstacle_clearance,
             "r_prog": jp.array(0.0, dtype=jp.float32),
+            "r_goal_prox": jp.array(0.0, dtype=jp.float32),
+            "r_goal_best": jp.array(0.0, dtype=jp.float32),
+            "r_goal_hover": jp.array(0.0, dtype=jp.float32),
             "r_obs": jp.array(0.0, dtype=jp.float32),
             "r_coll": jp.array(0.0, dtype=jp.float32),
             "r_energy": jp.array(0.0, dtype=jp.float32),
@@ -935,6 +954,9 @@ class newDrone(mjx_env.MjxEnv):
             "best_distance_to_goal": zero,
             "initial_distance": jp.asarray(initial_distance, dtype=jp.float32),
             "r_prog": zero,
+            "r_goal_prox": zero,
+            "r_goal_best": zero,
+            "r_goal_hover": zero,
             "r_obs": zero,
             "r_coll": zero,
             "r_energy": zero,
@@ -1571,6 +1593,14 @@ class newDrone(mjx_env.MjxEnv):
         r_coll = jp.where(collision, -self.r_collision, 0.0)
         r_energy = -self.w_energy * jp.dot(scaled_action, scaled_action)
         r_smooth = -self.w_smooth * jp.dot(delta_action, delta_action)
+        min_distance_to_goal = jp.minimum(info["min_distance_to_goal"], dist)
+        r_goal_best = self.w_goal_best_progress * (
+            info["min_distance_to_goal"] - min_distance_to_goal
+        )
+        goal_proximity = jp.exp(
+            -dist / jp.asarray(self.goal_proximity_scale, dtype=jp.float32)
+        )
+        r_goal_prox = self.w_goal_proximity * goal_proximity
 
         out_of_bounds = (
             (jp.abs(info["agent_location"][0]) > (self.safety_xy_scale * self.xylim))
@@ -1589,6 +1619,7 @@ class newDrone(mjx_env.MjxEnv):
         hovering_at_goal = (dist <= self.eps_goal) & (
             speed_sq <= jp.square(self.hover_speed_epsilon)
         )
+        r_goal_hover = self.w_goal_hover * jp.where(hovering_at_goal, 1.0, 0.0)
         goal_hold_streak = jp.where(
             hovering_at_goal,
             info["goal_hold_streak"] + 1,
@@ -1606,9 +1637,8 @@ class newDrone(mjx_env.MjxEnv):
             -(self.termination_penalty + self.terminal_distance_penalty * dist),
             0.0,
         )
-        reward = reward + r_terminal
+        reward = reward + r_goal_prox + r_goal_best + r_goal_hover + r_terminal
         episode_end = terminated | truncated
-        min_distance_to_goal = jp.minimum(info["min_distance_to_goal"], dist)
 
         invalid_reward = (-2.0 * self.r_collision) - self.termination_penalty
         reward = jp.where(invalid_state, invalid_reward, reward)
@@ -1641,6 +1671,9 @@ class newDrone(mjx_env.MjxEnv):
             ),
             "initial_distance": to_f32(info["initial_target_distance"]),
             "r_prog": to_f32(jp.where(invalid_state, 0.0, r_prog)),
+            "r_goal_prox": to_f32(jp.where(invalid_state, 0.0, r_goal_prox)),
+            "r_goal_best": to_f32(jp.where(invalid_state, 0.0, r_goal_best)),
+            "r_goal_hover": to_f32(jp.where(invalid_state, 0.0, r_goal_hover)),
             "r_obs": to_f32(jp.where(invalid_state, 0.0, r_obs)),
             "r_coll": to_f32(jp.where(invalid_state, -2.0 * self.r_collision, r_coll)),
             "r_energy": to_f32(jp.where(invalid_state, 0.0, r_energy)),
@@ -1703,6 +1736,9 @@ class newDrone(mjx_env.MjxEnv):
             "lidar_clearance": metrics["lidar_clearance"],
             "true_obstacle_clearance": metrics["true_obstacle_clearance"],
             "r_prog": metrics["r_prog"],
+            "r_goal_prox": metrics["r_goal_prox"],
+            "r_goal_best": metrics["r_goal_best"],
+            "r_goal_hover": metrics["r_goal_hover"],
             "r_obs": metrics["r_obs"],
             "r_coll": metrics["r_coll"],
             "r_energy": metrics["r_energy"],
