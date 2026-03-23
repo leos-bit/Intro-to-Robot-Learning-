@@ -57,7 +57,7 @@ def default_config() -> config_dict.ConfigDict:
         collision_terminate_steps=50,
         w_progress=30.0,
         w_goal_proximity=10.0,
-        goal_proximity_scale=2.5,
+        goal_proximity_scale=5.0,
         w_goal_best_progress=20.0,
         w_goal_hover=1.0,
         w_energy=0.01,
@@ -103,9 +103,9 @@ def default_config() -> config_dict.ConfigDict:
         outer_decim=2,
         position_hold_epsilon=0.05,
         yaw_hold_epsilon=0.1,
-        hover_speed_epsilon=0.15,
-        hover_success_steps=25,
-        landing_radius=1.5,
+        hover_speed_epsilon=0.25,
+        hover_success_steps=10,
+        landing_radius=2.0,
         landing_xy_speed=0.35,
         landing_z_speed=0.25,
         landing_xy_damping=1.0,
@@ -185,7 +185,7 @@ class newDrone(mjx_env.MjxEnv):
                 max(0.0, float(self._config.get("w_goal_proximity", 0.0)))
             )
             self.goal_proximity_scale = float(
-                max(0.1, float(self._config.get("goal_proximity_scale", 1.0)))
+                max(0.1, float(self._config.get("goal_proximity_scale", 5.0)))
             )
             self.w_goal_best_progress = float(
                 max(0.0, float(self._config.get("w_goal_best_progress", 0.0)))
@@ -239,12 +239,12 @@ class newDrone(mjx_env.MjxEnv):
             self.position_hold_epsilon = float(max(0.0, float(self._config.position_hold_epsilon)))
             self.yaw_hold_epsilon = float(max(0.0, float(self._config.yaw_hold_epsilon)))
             self.hover_speed_epsilon = float(
-                max(0.0, float(self._config.get("hover_speed_epsilon", 0.3)))
+                max(0.0, float(self._config.get("hover_speed_epsilon", 0.25)))
             )
             self.hover_success_steps = max(
-                1, int(self._config.get("hover_success_steps", 15))
+                1, int(self._config.get("hover_success_steps", 10))
             )
-            self.landing_radius = float(max(0.1, float(self._config.get("landing_radius", 1.5))))
+            self.landing_radius = float(max(0.1, float(self._config.get("landing_radius", 2.0))))
             self.landing_xy_speed = float(max(0.05, float(self._config.get("landing_xy_speed", 0.35))))
             self.landing_z_speed = float(max(0.05, float(self._config.get("landing_z_speed", 0.25))))
             self.safety_xy_scale = float(max(1.0, float(self._config.safety_xy_scale)))
@@ -748,8 +748,29 @@ class newDrone(mjx_env.MjxEnv):
                 axis=1,
             )
 
+        distance_shortfall = jp.maximum(0.0, self.target_dist_min - dists)
+        distance_overshoot = jp.zeros_like(dists)
+        if self.target_dist_max is not None:
+            distance_overshoot = jp.maximum(0.0, dists - self.target_dist_max)
+
+        obstacle_clearance_shortfall = jp.zeros_like(dists)
+        if obstacle_positions is not None and obstacle_mask is not None and self.max_obstacles > 0:
+            active_mask = jp.asarray(obstacle_mask, dtype=jp.bool_)
+            obstacle_clearance_shortfall = jp.max(
+                jp.where(
+                    active_mask[None, :],
+                    jp.maximum(0.0, self.obstacle_target_clearance - obstacle_dists),
+                    0.0,
+                ),
+                axis=1,
+            )
+
+        candidate_penalty = (
+            distance_shortfall + distance_overshoot + obstacle_clearance_shortfall
+        )
         first_valid = jp.argmax(valid.astype(jp.int32))
-        chosen_idx = jp.where(jp.any(valid), first_valid, num_samples - 1)
+        least_bad = jp.argmin(candidate_penalty)
+        chosen_idx = jp.where(jp.any(valid), first_valid, least_bad)
         return candidates[chosen_idx]
 
     def _obstacle_reward_terms(
@@ -1675,10 +1696,18 @@ class newDrone(mjx_env.MjxEnv):
             "distance": to_f32(dist),
             "distance_to_goal_per_step": to_f32(dist),
             "final_distance_to_goal": to_f32(
-                jp.where(invalid_state | (~episode_end), 0.0, dist)
+                jp.where(
+                    ~episode_end,
+                    0.0,
+                    jp.where(invalid_state, info["prev_distance"], dist),
+                )
             ),
             "best_distance_to_goal": to_f32(
-                jp.where(invalid_state | (~episode_end), 0.0, min_distance_to_goal)
+                jp.where(
+                    ~episode_end,
+                    0.0,
+                    jp.where(invalid_state, info["min_distance_to_goal"], min_distance_to_goal),
+                )
             ),
             "initial_distance": to_f32(info["initial_target_distance"]),
             "r_prog": to_f32(jp.where(invalid_state, 0.0, r_prog)),

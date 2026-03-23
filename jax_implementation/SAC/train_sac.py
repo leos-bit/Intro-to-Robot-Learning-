@@ -352,6 +352,9 @@ def _validate_train_configs(
 
 def _checkpoint_rank(metrics: dict[str, Any]) -> tuple[float, float, float]:
     """Rank checkpoints by success, then final goal distance, then eval reward."""
+    numerical_issue = _safe_float_scalar(metrics.get("eval/episode_numerical_issue"))
+    if numerical_issue is not None and numerical_issue > 0.0:
+        return (float("-inf"), float("-inf"), float("-inf"))
     success = _safe_float_scalar(metrics.get("eval/episode_success"))
     final_distance = _safe_float_scalar(metrics.get("eval/episode_final_distance_to_goal"))
     reward = _safe_float_scalar(metrics.get("eval/episode_reward"))
@@ -389,6 +392,9 @@ def _save_best_checkpoint(
         ),
         "eval_distance_to_goal_per_step": _safe_float_scalar(
             metrics.get("eval/episode_distance_to_goal_per_step")
+        ),
+        "eval_numerical_issue": _safe_float_scalar(
+            metrics.get("eval/episode_numerical_issue")
         ),
     }
     best_meta_path.write_text(json.dumps(best_meta, indent=2), encoding="utf-8")
