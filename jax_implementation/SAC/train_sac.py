@@ -276,10 +276,23 @@ def _apply_env_overrides(env_cfg: config_dict.ConfigDict, overrides_json: str | 
     if not isinstance(overrides, dict):
         raise ValueError("--env_overrides must decode to a JSON object/dict.")
     for key, value in overrides.items():
-        current_value = env_cfg.get(key, None)
-        if isinstance(current_value, jax.Array):
-            value = jp.asarray(value, dtype=current_value.dtype)
-        env_cfg[key] = value
+        env_cfg[key] = _coerce_env_override_value(env_cfg.get(key, None), value)
+
+
+def _coerce_env_override_value(current_value: Any, value: Any) -> Any:
+    """Coerce override values to the existing config field type when safe."""
+    if isinstance(current_value, jax.Array):
+        return jp.asarray(value, dtype=current_value.dtype)
+    if isinstance(current_value, bool):
+        return bool(value)
+    if isinstance(current_value, int) and not isinstance(current_value, bool):
+        if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+            return int(value)
+        return value
+    if isinstance(current_value, float):
+        if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+            return float(value)
+    return value
 
 
 def _make_env_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
@@ -288,7 +301,7 @@ def _make_env_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
     env_cfg.max_steps = args.episode_length
     env_cfg.episode_length = args.episode_length
     for key, value in default_env_overrides().items():
-        env_cfg[key] = value
+        env_cfg[key] = _coerce_env_override_value(env_cfg.get(key, None), value)
     _apply_env_overrides(env_cfg, args.env_overrides)
     return env_cfg
 
