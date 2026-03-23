@@ -16,10 +16,11 @@ from typing import Any
 
 from brax.training.agents.sac import networks as sac_networks
 from brax.training.agents.sac import train as sac
-from brax.envs import base as brax_envs
 import jax
 import jax.numpy as jp
 from ml_collections import config_dict
+from mujoco_playground import wrapper
+from mujoco_playground._src import mjx_env
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -130,10 +131,10 @@ def _default_sac_cfg() -> config_dict.ConfigDict:
     return cfg
 
 
-class StateObsWrapper(brax_envs.Wrapper):
+class StateObsWrapper(wrapper.Wrapper):
     """Convert dict observations from Drone_env into a single flat vector."""
 
-    def __init__(self, env: brax_envs.Env):
+    def __init__(self, env: mjx_env.MjxEnv):
         super().__init__(env)
         self._model_assets = env.model_assets
         if hasattr(env, "obs_spec"):
@@ -178,11 +179,11 @@ class StateObsWrapper(brax_envs.Wrapper):
             axis=-1,
         )
 
-    def reset(self, rng: jax.Array) -> brax_envs.State:
+    def reset(self, rng: jax.Array) -> mjx_env.State:
         state = self.env.reset(rng)
         return state.replace(obs=self._pack_obs(state.obs))
 
-    def step(self, state: brax_envs.State, action: jax.Array) -> brax_envs.State:
+    def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
         state = self.env.step(state, action)
         return state.replace(obs=self._pack_obs(state.obs))
 
@@ -750,6 +751,12 @@ def train(args: argparse.Namespace):
         checkpoint_logdir=str(ckpt_dir),
         wrap_env=True,
     )
+    if supported_train_args and "wrap_env_fn" not in supported_train_args:
+        raise RuntimeError(
+            "Installed brax.training SAC does not support custom wrap_env_fn, "
+            "which is required for MuJoCo Playground MJX envs."
+        )
+    train_fn_kwargs["wrap_env_fn"] = wrapper.wrap_for_brax_training
     if (not supported_train_args) or ("num_eval_envs" in supported_train_args):
         train_fn_kwargs["num_eval_envs"] = num_eval_envs
     train_fn = functools.partial(sac.train, **train_fn_kwargs)
