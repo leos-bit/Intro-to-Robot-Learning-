@@ -16,17 +16,21 @@ from typing import Any
 
 from brax.training.agents.sac import networks as sac_networks
 from brax.training.agents.sac import train as sac
+from brax.envs import base as brax_envs
 import jax
 import jax.numpy as jp
 from ml_collections import config_dict
-from mujoco_playground import wrapper
-from mujoco_playground._src import mjx_env
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
+from jax_implementation.SAC.sac_config import (
+    DEFAULT_LOG_ROOT,
+    default_env_overrides,
+    default_sac_overrides,
+)
 from jax_implementation.env import default_config, newDrone
 try:
     from tqdm import tqdm
@@ -69,40 +73,15 @@ def _canonicalize_model_assets(assets: dict[str, bytes]) -> dict[str, bytes]:
 
 def _default_sac_cfg() -> config_dict.ConfigDict:
     """SAC config tuned for stable MJX drone training."""
-    return config_dict.ConfigDict(
-        dict(
-            num_timesteps=20_000_000,
-            num_evals=20,
-            reward_scaling=1.0,
-            episode_length=5000,
-            normalize_observations=True,
-            deterministic_eval=True,
-            action_repeat=1,
-            discounting=0.99,
-            learning_rate=3e-4,
-            num_envs=1024,
-            num_eval_envs=128,
-            batch_size=2048,
-            tau=0.005,
-            min_replay_size=65_536,
-            max_replay_size=1_000_000,
-            grad_updates_per_step=1,
-            run_evals=True,
-            network_factory=config_dict.ConfigDict(
-                dict(
-                    hidden_layer_sizes=[1024, 1024],
-                    policy_network_layer_norm=False,
-                    q_network_layer_norm=False,
-                )
-            ),
-        )
-    )
+    cfg = config_dict.ConfigDict(default_sac_overrides())
+    cfg.network_factory = config_dict.ConfigDict(dict(cfg.network_factory))
+    return cfg
 
 
-class StateObsWrapper(wrapper.Wrapper):
+class StateObsWrapper(brax_envs.Wrapper):
     """Convert dict observations from Drone_env into a single flat vector."""
 
-    def __init__(self, env: mjx_env.MjxEnv):
+    def __init__(self, env: brax_envs.Env):
         super().__init__(env)
         self._model_assets = env.model_assets
         if hasattr(env, "obs_spec"):
@@ -147,11 +126,11 @@ class StateObsWrapper(wrapper.Wrapper):
             axis=-1,
         )
 
-    def reset(self, rng: jax.Array) -> mjx_env.State:
+    def reset(self, rng: jax.Array) -> brax_envs.State:
         state = self.env.reset(rng)
         return state.replace(obs=self._pack_obs(state.obs))
 
-    def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
+    def step(self, state: brax_envs.State, action: jax.Array) -> brax_envs.State:
         state = self.env.step(state, action)
         return state.replace(obs=self._pack_obs(state.obs))
 
@@ -165,12 +144,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--suffix", type=str, default=None)
-    parser.add_argument("--log_root", type=str, default="drone_training/artifacts/playground_ppo")
+    parser.add_argument("--log_root", type=str, default=DEFAULT_LOG_ROOT)
     parser.add_argument(
         "--tensorboard",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Enable TensorBoard logging for Playground PPO runs.",
+        help="Enable TensorBoard logging for SAC runs.",
     )
     parser.add_argument(
         "--tensorboard_dir",
@@ -256,6 +235,8 @@ def _make_env_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
     env_cfg.impl = args.impl
     env_cfg.max_steps = args.episode_length
     env_cfg.episode_length = args.episode_length
+    for key, value in default_env_overrides().items():
+        env_cfg[key] = value
     _apply_env_overrides(env_cfg, args.env_overrides)
     return env_cfg
 
@@ -302,6 +283,15 @@ def _jsonable_config(value: Any) -> Any:
     if isinstance(value, np.generic):
         return value.item()
     return value
+
+
+def _metrics_record(num_steps: int, metrics: dict[str, Any]) -> dict[str, Any]:
+    """Convert callback metrics into a JSON-safe row for later plotting."""
+    record: dict[str, Any] = {"num_steps": int(num_steps)}
+    for key, value in metrics.items():
+        scalar = _safe_float_scalar(value)
+        record[key] = scalar if scalar is not None else _jsonable_config(value)
+    return record
 
 
 def _safe_float_scalar(value: Any) -> float | None:
@@ -592,6 +582,8 @@ def train(args: argparse.Namespace):
     ckpt_dir = logdir / "checkpoints"
     best_ckpt_dir = ckpt_dir / "best"
     best_ckpt_meta_path = ckpt_dir / "best_checkpoint.json"
+    metrics_path = logdir / "metrics.jsonl"
+    latest_metrics_path = logdir / "latest_metrics.json"
     tb_dir = Path(args.tensorboard_dir).resolve() if args.tensorboard_dir else (logdir / "tensorboard")
     ckpt_dir.mkdir(parents=True, exist_ok=True)
     if args.tensorboard:
@@ -685,7 +677,7 @@ def train(args: argparse.Namespace):
         seed=args.seed,
         restore_checkpoint_path=restore_checkpoint_path,
         checkpoint_logdir=str(ckpt_dir),
-        wrap_env_fn=wrapper.wrap_for_brax_training,
+        wrap_env=True,
     )
     if (not supported_train_args) or ("num_eval_envs" in supported_train_args):
         train_fn_kwargs["num_eval_envs"] = num_eval_envs
@@ -748,6 +740,11 @@ def train(args: argparse.Namespace):
                     )
         else:
             logger.log_train(num_steps, metrics)
+
+        record = _metrics_record(int(num_steps), metrics)
+        with metrics_path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(record) + "\n")
+        latest_metrics_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
         if tb_writer is not None:
             try:

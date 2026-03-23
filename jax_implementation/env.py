@@ -10,14 +10,11 @@ import jax
 import jax.numpy as jp
 from lxml import etree
 from ml_collections import config_dict
+from brax.envs import base as brax_envs
 import mujoco
 import mujoco.viewer
 from mujoco import mjx
 import numpy as np
-
-from mujoco_playground._src import mjx_env
-from mujoco_playground._src import reward
-from mujoco_playground._src.dm_control_suite import common
 
 _XML_PATH = "mujoco_drone_imp/Drone_MJCFs/skydio_x2/scene.xml"
 NUM_PID_GAINS = 12
@@ -150,10 +147,18 @@ def default_config() -> config_dict.ConfigDict:
 
 
 
-class newDrone(mjx_env.MjxEnv):
+class newDrone(brax_envs.Env):
     def __init__(self, config: config_dict.ConfigDict = default_config(),
       config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,):
-            super().__init__(config, config_overrides)
+            self._config = self._apply_config_overrides(config, config_overrides)
+            self._ctrl_dt = float(self._config.ctrl_dt)
+            self.sim_dt = float(self._config.sim_dt)
+            self._backend = "mjx"
+            self.n_substeps = max(
+                1,
+                int(round(self._ctrl_dt / max(self.sim_dt, 1e-6)))
+                * int(self._config.get("action_repeat", 1)),
+            )
 
             self._xml_path = str(Path(self._config.get("model_path", _XML_PATH)).resolve())
             self._model_assets = self._collect_model_assets(Path(self._xml_path))
@@ -803,7 +808,7 @@ class newDrone(mjx_env.MjxEnv):
             "distance": distance,
             "initial_distance": initial_distance,
         }
-    def reset(self, rng: jax.Array) -> mjx_env.State:
+    def reset(self, rng: jax.Array) -> brax_envs.State:
         rng, spawn_rng, obstacle_rng, target_rng = jax.random.split(rng, 4)
         sx, sy, sz = jax.random.split(spawn_rng, 3)
         z_span = max(self.zlim - self.spawn_z_min, 0.0)
@@ -931,8 +936,8 @@ class newDrone(mjx_env.MjxEnv):
         metrics = self._init_step_metrics(initial_target_distance, initial_target_distance)
         obs = self._get_obs(info)
         self._last_info = info
-        return mjx_env.State(
-            data=data,
+        return brax_envs.State(
+            pipeline_state=data,
             obs=obs,
             reward=jp.array(0.0, dtype=jp.float32),
             # Brax wrappers expect numeric done for stable truncation/episode_done dtypes.
@@ -1336,7 +1341,8 @@ class newDrone(mjx_env.MjxEnv):
 
     def _physics_step(self, data: mjx.Data, motor_cmd: jax.Array) -> mjx.Data:
         ctrl = jp.asarray(motor_cmd, dtype=data.ctrl.dtype)
-        return mjx_env.step(self.mjx_model, data, ctrl, 1)
+        data = data.replace(ctrl=ctrl)
+        return mjx.step(self.mjx_model, data)
 
     def _extract_body_state(
         self,
@@ -1497,17 +1503,19 @@ class newDrone(mjx_env.MjxEnv):
 
     def step(
         self,
-        state: mjx_env.State,
+        state: brax_envs.State,
         action: jax.Array,
         gain_arr: Optional[jax.Array] = None,
-    ) -> mjx_env.State:
+    ) -> brax_envs.State:
         raw_action = jp.asarray(action, dtype=jp.float32).reshape((4,))
         raw_action = jp.nan_to_num(raw_action, nan=0.0, posinf=1.0, neginf=-1.0)
         raw_action = jp.clip(raw_action, self._action_low, self._action_high)
         scaled_action = raw_action * self.action_scale
         gain_ar = self.gain_arr if gain_arr is None else jp.asarray(gain_arr, dtype=jp.float32)
         gain_ar = gain_ar.reshape((NUM_PID_GAINS,))
-        data, controller_state = self._run_cascaded_controller(state.data, state.info, scaled_action, gain_ar)
+        data, controller_state = self._run_cascaded_controller(
+            state.pipeline_state, state.info, scaled_action, gain_ar
+        )
         applied_action = controller_state["held_action"]
         (
             agent_location,
@@ -1552,8 +1560,8 @@ class newDrone(mjx_env.MjxEnv):
             invalid_state,
         )
         self._last_info = info
-        return mjx_env.State(
-            data=data,
+        return brax_envs.State(
+            pipeline_state=data,
             obs=obs,
             reward=reward.astype(jp.float32),
             done=done,
@@ -1767,7 +1775,7 @@ class newDrone(mjx_env.MjxEnv):
 
     def _resolve_info(
         self,
-        state: Optional[mjx_env.State] = None,
+        state: Optional[brax_envs.State] = None,
         info: Optional[dict[str, jax.Array]] = None,
     ) -> dict[str, jax.Array]:
         if info is not None:
@@ -1780,7 +1788,7 @@ class newDrone(mjx_env.MjxEnv):
 
     def _drone_to_target(
         self,
-        state: Optional[mjx_env.State] = None,
+        state: Optional[brax_envs.State] = None,
         info: Optional[dict[str, jax.Array]] = None,
     ) -> jax.Array:
         env_info = self._resolve_info(state=state, info=info)
@@ -1794,7 +1802,7 @@ class newDrone(mjx_env.MjxEnv):
 
     def _drone_vels_yawrate(
         self,
-        state: Optional[mjx_env.State] = None,
+        state: Optional[brax_envs.State] = None,
         info: Optional[dict[str, jax.Array]] = None,
     ) -> jax.Array:
         env_info = self._resolve_info(state=state, info=info)
@@ -1820,12 +1828,27 @@ class newDrone(mjx_env.MjxEnv):
         return self._action_high
 
     @property
+    def observation_size(self):
+        return {
+            key: tuple(int(dim) for dim in spec["shape"])
+            for key, spec in self.obs_spec.items()
+        }
+
+    @property
+    def backend(self):
+        return self._backend
+
+    @property
     def mj_model(self):
         return self._mj_model
 
     @property
     def mjx_model(self):
         return self._mjx_model
+
+    @property
+    def model_assets(self):
+        return self._model_assets
 
 
 
@@ -1842,7 +1865,7 @@ class newDrone(mjx_env.MjxEnv):
         return cfg
 
 
-def _pid_demo_action(env: newDrone, state: mjx_env.State) -> jax.Array:
+def _pid_demo_action(env: newDrone, state: brax_envs.State) -> jax.Array:
     goal_vec = jp.asarray(state.info["target"] - state.info["agent_location"], dtype=jp.float32)
     vel_cmd = jp.clip(
         jp.array(
@@ -1861,13 +1884,13 @@ def _pid_demo_action(env: newDrone, state: mjx_env.State) -> jax.Array:
     return jp.clip(action, env.action_low, env.action_high).astype(jp.float32)
 
 
-def _sync_viewer_data(env: newDrone, viewer_data: mujoco.MjData, state: mjx_env.State) -> None:
-    viewer_data.qpos[:] = np.asarray(state.data.qpos)
-    viewer_data.qvel[:] = np.asarray(state.data.qvel)
-    viewer_data.ctrl[:] = np.asarray(state.data.ctrl)
+def _sync_viewer_data(env: newDrone, viewer_data: mujoco.MjData, state: brax_envs.State) -> None:
+    viewer_data.qpos[:] = np.asarray(state.pipeline_state.qpos)
+    viewer_data.qvel[:] = np.asarray(state.pipeline_state.qvel)
+    viewer_data.ctrl[:] = np.asarray(state.pipeline_state.ctrl)
     if env.mj_model.nmocap > 0:
-        viewer_data.mocap_pos[:] = np.asarray(state.data.mocap_pos)
-        viewer_data.mocap_quat[:] = np.asarray(state.data.mocap_quat)
+        viewer_data.mocap_pos[:] = np.asarray(state.pipeline_state.mocap_pos)
+        viewer_data.mocap_quat[:] = np.asarray(state.pipeline_state.mocap_quat)
     mujoco.mj_forward(env.mj_model, viewer_data)
 
 
