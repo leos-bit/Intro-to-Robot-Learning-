@@ -1605,10 +1605,14 @@ class newDrone(brax_envs.Env):
         r_goal_best = self.w_goal_best_progress * (
             info["min_distance_to_goal"] - min_distance_to_goal
         )
-        goal_proximity = jp.exp(
-            -dist / jp.asarray(self.goal_proximity_scale, dtype=jp.float32)
+        # Only pay proximity reward inside a local basin near the target.
+        # This avoids farming positive reward by loitering several meters away.
+        goal_near_frac = jp.clip(
+            1.0 - (dist / jp.asarray(self.goal_proximity_scale, dtype=jp.float32)),
+            0.0,
+            1.0,
         )
-        r_goal_prox = self.w_goal_proximity * goal_proximity
+        r_goal_prox = self.w_goal_proximity * jp.square(goal_near_frac)
 
         out_of_bounds = (
             (jp.abs(info["agent_location"][0]) > (self.safety_xy_scale * self.xylim))
