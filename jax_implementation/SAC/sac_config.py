@@ -16,7 +16,7 @@ def default_env_overrides() -> config_dict.ConfigDict:
             zlim=3.5,
             vellim=1.5,
             yawrate_lim=0.7,
-            action_scale=0.35,
+            action_scale=1.0,
             spawn_z_min=0.8,
             target_dist_min=0.8,
             target_dist_max=3.5,

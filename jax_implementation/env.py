@@ -50,7 +50,7 @@ def default_config() -> config_dict.ConfigDict:
         zlim=8,
         vellim=2,
         yawrate_lim=2,
-        action_scale=0.5,
+        action_scale=1.0,
         spawn_z_min=0.3,
         target_dist_min=2,
         target_dist_max=7,
