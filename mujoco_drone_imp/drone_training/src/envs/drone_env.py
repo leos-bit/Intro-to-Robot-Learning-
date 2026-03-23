@@ -149,6 +149,7 @@ class Drone_Env(gym.Env):
         self._step= 0
         self._collision_streak = 0
         self.render_mode = render_mode
+        self.render_camera = "track"
         self._renderer = None
         self._viewer = None
     def _get_obs(self):
@@ -434,7 +435,7 @@ class Drone_Env(gym.Env):
         if self.render_mode == "rgb_array":
             if self._renderer is None:
                 self._renderer = mj.Renderer(self.model, height=480, width=640)
-            self._renderer.update_scene(self.data)
+            self._renderer.update_scene(self.data, camera=self.render_camera)
             frame = self._renderer.render()  # np.ndarray HxWx3 uint8
             return frame
 
