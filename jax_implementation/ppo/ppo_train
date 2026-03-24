@@ -22,7 +22,7 @@ from ml_collections import config_dict
 from mujoco_playground import wrapper
 from mujoco_playground._src import mjx_env
 import numpy as np
-
+import rscope
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -33,10 +33,10 @@ try:
 except ImportError:
     tqdm = None
 
-try:
-    from torch.utils.tensorboard import SummaryWriter
-except Exception:
-    SummaryWriter = None
+# try:
+#     from torch.utils.tensorboard import SummaryWriter
+# except Exception:
+#     SummaryWriter = None
 
 
 def _rscope_summary_fn(full_states, obs, rew, done):
@@ -98,8 +98,8 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
             training_metrics_steps=50_000,
             network_factory=config_dict.ConfigDict(
                 dict(
-                    policy_hidden_layer_sizes=[512, 512],
-                    value_hidden_layer_sizes=[512, 512],
+                    policy_hidden_layer_sizes=[1024, 1024],
+                    value_hidden_layer_sizes=[1024, 1024],
                     policy_obs_key="state",
                     value_obs_key="state",
                 )
