@@ -1,0 +1,10 @@
+{
+  "source_step": 6375424,
+  "source_checkpoint": "/home/sid/Desktop/Intro-to-Robot-Learning-/jax_implementation/SAC/artifacts/DroneMJX-20260324-162132/checkpoints/000006375424",
+  "eval_reward": 90.39005279541016,
+  "eval_success": 0.2578125,
+  "eval_final_distance_to_goal": 2.2331442832946777,
+  "eval_best_distance_to_goal": 1.8910627365112305,
+  "eval_distance_to_goal_per_step": 2.315670558216517,
+  "eval_numerical_issue": 0.0
+}

@@ -32,7 +32,7 @@ def default_sac_overrides() -> config_dict.ConfigDict:
     """Training defaults for the off-policy SAC baseline."""
     return config_dict.ConfigDict(
         dict(
-            num_timesteps=20_000_000,
+            num_timesteps=60_000_000,
             num_evals=20,
             reward_scaling=1.0,
             episode_length=2_000,

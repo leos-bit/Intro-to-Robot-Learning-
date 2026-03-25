@@ -33,10 +33,10 @@ try:
 except ImportError:
     tqdm = None
 
-# try:
-#     from torch.utils.tensorboard import SummaryWriter
-# except Exception:
-#     SummaryWriter = None
+try:
+    from torch.utils.tensorboard import SummaryWriter
+except Exception:
+    SummaryWriter = None
 
 
 def _rscope_summary_fn(full_states, obs, rew, done):
