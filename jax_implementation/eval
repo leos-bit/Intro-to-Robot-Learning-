@@ -10,7 +10,8 @@ from brax.training.acme import running_statistics
 from brax.training.agents.ppo import checkpoint as ppo_checkpoint
 from brax.training.agents.ppo import networks as ppo_networks
 import sys
-_REPO_ROOT = Path(__file__).resolve().parents[2]
+_THIS_FILE = Path(__file__).resolve()
+_REPO_ROOT = _THIS_FILE.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from jax_implementation.env import newDrone, default_config
@@ -64,7 +65,10 @@ def _load_env_cfg_from_checkpoint(ckpt: Path):
 
 
 def load_policy(ckpt: Path):
-    ns = runpy.run_path("jax_implementation/ppo/ppo_train", run_name="ppo_train_test")
+    ns = runpy.run_path(
+        str(_REPO_ROOT / "jax_implementation/ppo/ppo_train"),
+        run_name="ppo_train_test",
+    )
     StateObsWrapper = ns["StateObsWrapper"]
 
     ckpt = Path(ckpt).resolve()
@@ -120,6 +124,23 @@ def _sync_viewer_data(env: newDrone, viewer_data: mujoco.MjData, state: mjx_env.
         viewer_data.mocap_quat[:] = np.asarray(state.data.mocap_quat)
     mujoco.mj_forward(env.mj_model, viewer_data)
 
+
+def _set_overview_camera(env: newDrone, viewer) -> None:
+    arena_half_extent = float(getattr(env, "xylim", 10.0))
+    arena_height = float(getattr(env, "zlim", 8.0))
+    arena_diagonal = float(np.sqrt(8.0 * (arena_half_extent ** 2) + (arena_height ** 2)))
+
+    viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FREE
+    viewer.cam.fixedcamid = -1
+    viewer.cam.lookat[:] = np.array(
+        [0.0, 0.0, max(1.5, min(arena_height * 0.4, arena_height - 0.5))],
+        dtype=np.float64,
+    )
+    viewer.cam.distance = max(arena_diagonal * 1.2, arena_half_extent * 2.8)
+    viewer.cam.azimuth = 135.0
+    viewer.cam.elevation = -30.0
+
+
 def run_eval_single(
     policy, 
     env,
@@ -142,10 +163,8 @@ def run_eval_single(
         viewer_data = mujoco.MjData(base_env.mj_model)
         _sync_viewer_data(base_env, viewer_data, state)
         viewer = mujoco.viewer.launch_passive(base_env.mj_model, viewer_data)
-        if base_env._track_camera_id >= 0:
-            viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
-            viewer.cam.fixedcamid = base_env._track_camera_id
-            viewer.sync()
+        _set_overview_camera(base_env, viewer)
+        viewer.sync()
 
 
     try:
@@ -190,13 +209,80 @@ def run_eval_single(
     finally:
         if viewer is not None:
             viewer.close()
+def run_eval_random(
+    env,
+    num_steps: int = 2000,
+    seed: int = 0,
+    render: bool = True,
+    jit_step: bool = True,
+     
+) -> None:
+    base_env = env.env if hasattr(env, "env") else env
+
+    rng = jax.random.PRNGKey(seed)
+    rng, reset_rng = jax.random.split(rng)
+    state = env.reset(reset_rng)
+
+    step_fn = jax.jit(env.step) if jit_step else env.step
+    viewer = None
+    viewer_data = None
+    if render:
+        viewer_data = mujoco.MjData(base_env.mj_model)
+        _sync_viewer_data(base_env, viewer_data, state)
+        viewer = mujoco.viewer.launch_passive(base_env.mj_model, viewer_data)
+        _set_overview_camera(base_env, viewer)
+        viewer.sync()
+
+
+    try:
+        for step in range(num_steps):
+            rng, action_key = jax.random.split(rng)
+            action = jax.random.uniform(key=action_key, shape = (4, 1), dtype=jp.float32, minval=-1, maxval=1)
+            step_start = time.perf_counter()
+            state = step_fn(state, action)
+
+            if render and viewer is not None:
+                _sync_viewer_data(base_env, viewer_data, state)
+                viewer.sync()
+                if hasattr(viewer, "is_running") and not viewer.is_running():
+                    print("Viewer closed, stopping demo.")
+                    break
+
+            if step % 50 == 0:
+                dist = float(state.info["distance"])
+                pos = np.asarray(state.info["agent_location"])
+                vel = np.asarray(state.info["agent_vel"])
+                hold_streak = int(state.info["goal_hold_streak"])
+                print(
+                    f"step={step:04d} reward={float(state.reward): .3f} "
+                    f"dist={dist: .3f} hold={hold_streak:03d} "
+                    f"pos={np.round(pos, 3)} vel={np.round(vel, 3)}"
+                )
+
+            if bool(state.done):
+                print(
+                    "episode ended",
+                    f"step={step}",
+                    f"success={bool(state.info['success'])}",
+                    f"collision={bool(state.info['collision'])}",
+                    f"oob={bool(state.info['out_of_bounds'])}",
+                    f"numerical_issue={bool(state.info['numerical_issue'])}",
+                )
+                rng, reset_rng = jax.random.split(rng)
+                state = env.reset(reset_rng)
+
+    except KeyboardInterrupt:
+        print("\nStopped by user.")
+    finally:
+        if viewer is not None:
+            viewer.close()
 
 
 if __name__ == "__main__":
-    model, env, params = load_policy("drone_training/artifacts/playground_ppo/DroneMJX-20260317-093454/checkpoints/000034078720")
+    model, env, params = load_policy("drone_training/latest_ppo/playground_ppo/DroneMJX-20260324-182737/checkpoints/000062259200")
    
     seed = int(np.random.randint(0, 1_000_000))
-    run_eval_single(model, env, 10000,seed, True, True)
+    # run_eval_single(model, env, 10000,seed, True, True)
     
     
-    
+    run_eval_random(env, num_steps=2000, seed=seed, render=True, jit_step=True)
