@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Intro to Robot Learning Project</title>
-  <meta name="description" content="Drone pathing with reinforcement learning in Gazebo, including random-agent baseline videos and results.">
+  <meta name="description" content="Drone pathing with reinforcement learning, experimental PPO and SAC results, and policy rollout videos.">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -12,14 +12,14 @@
     <div class="container">
       <p class="eyebrow">CMU Intro to Robot Learning</p>
       <h1>Drone Pathing using Reinforcement Learning</h1>
-      <p class="authors">Leo Shaw • Siddarth Ashok</p>
+      <p class="authors">Leo Shaw and Siddarth Ashok</p>
       <p class="subtitle">
-        Gazebo-based quadrotor navigation with disturbance robustness, random-agent baselines, and RL training comparisons.
+        Quadrotor navigation with reinforcement learning, experimental training results, and policy rollout videos.
       </p>
       <nav class="hero-nav" aria-label="Primary">
         <a href="#overview">Overview</a>
         <a href="#results">Results</a>
-        <a href="#videos">Random Agent Videos</a>
+        <a href="#videos">Agent Videos</a>
         <a href="#repro">Reproducibility</a>
       </nav>
     </div>
@@ -31,23 +31,23 @@
         <article class="card">
           <h2>Project Overview</h2>
           <p>
-            This project studies robust drone navigation in cluttered environments under wind disturbances.
+            This project studies autonomous drone navigation in cluttered environments using reinforcement learning.
             The agent must reach a goal while avoiding collisions and controlling effort.
           </p>
           <ul>
-            <li>Simulator: Gazebo Sim</li>
-            <li>Platform: Quadrotor model in SDF</li>
-            <li>Baseline: Random policy</li>
+            <li>Simulator: MuJoCo</li>
+            <li>Platform: Skydio X2-style quadrotor</li>
+            <li>Methods: PPO, SAC, and random baseline</li>
             <li>Evaluation: Return, collisions, success rate</li>
           </ul>
         </article>
         <article class="card">
           <h2>Environment Setup</h2>
-          <p>Key files currently used in this repository:</p>
+          <p>Key assets currently used in this repository:</p>
           <ul>
-            <li><code>quad_world.sdf</code> - world configuration</li>
-            <li><code>quad_model.sdf</code> - quadrotor model and plugins</li>
-            <li><code>random_policy.py</code> - random action baseline</li>
+            <li><code>mujoco_drone_imp/</code> - MuJoCo environment and training code</li>
+            <li><code>midterm vids/reward_curves.png</code> - PPO/SAC reward comparison</li>
+            <li><code>midterm vids/SAC.mp4</code> and <code>midterm vids/ppo.mp4</code> - policy videos</li>
           </ul>
         </article>
       </div>
@@ -55,17 +55,17 @@
 
     <section id="results" class="section alt">
       <div class="container">
-        <h2>Initial Results</h2>
+        <h2>Experimental Results</h2>
         <figure class="card figure-card">
-          <img src="res_graph.png" alt="Return versus environment steps graph">
-          <figcaption>Current result snapshot from the repository.</figcaption>
+          <img src="midterm%20vids/reward_curves.png" alt="PPO and SAC reward curves with random baseline">
+          <figcaption>Mean return versus training environment steps for PPO, SAC, and a random-agent baseline.</figcaption>
         </figure>
       </div>
     </section>
 
     <section id="videos" class="section">
       <div class="container">
-        <h2>Random Agent Performance Videos</h2>
+        <h2>Agent Performance Videos</h2>
         <div class="video-grid">
           <article class="card video-card">
             <h3>Random Agent Run 1</h3>
@@ -76,20 +76,20 @@
             <p class="muted">Expected file: <code>videos/random_run_01.mp4</code></p>
           </article>
           <article class="card video-card">
-            <h3>Random Agent Run 2</h3>
-            <video controls preload="metadata" aria-label="Random Agent Run 2">
-              <source src="videos/random_run_02.mp4" type="video/mp4">
+            <h3>SAC Policy</h3>
+            <video controls preload="metadata" aria-label="SAC Policy Video">
+              <source src="midterm%20vids/SAC.mp4" type="video/mp4">
               Your browser does not support embedded video.
             </video>
-            <p class="muted">Expected file: <code>videos/random_run_02.mp4</code></p>
+            <p class="muted">Expected file: <code>midterm vids/SAC.mp4</code></p>
           </article>
           <article class="card video-card">
-            <h3>Random Agent Run 3</h3>
-            <video controls preload="metadata" aria-label="Random Agent Run 3">
-              <source src="videos/random_run_03.mp4" type="video/mp4">
+            <h3>PPO Policy</h3>
+            <video controls preload="metadata" aria-label="PPO Policy Video">
+              <source src="midterm%20vids/ppo.mp4" type="video/mp4">
               Your browser does not support embedded video.
             </video>
-            <p class="muted">Expected file: <code>videos/random_run_03.mp4</code></p>
+            <p class="muted">Expected file: <code>midterm vids/ppo.mp4</code></p>
           </article>
         </div>
       </div>
@@ -99,11 +99,11 @@
       <div class="container">
         <h2>Reproducibility</h2>
         <div class="card">
-          <p>Minimal startup flow on macOS:</p>
-          <pre><code>gz sim -s quad_world.sdf
-gz sim -g
-conda activate gz-ws
-python3 random_policy.py</code></pre>
+          <p>Minimal startup flow for the MuJoCo reinforcement-learning setup:</p>
+          <pre><code>cd mujoco_drone_imp
+$env:PYTHONPATH = (Get-Location).Path
+python -m drone_training.src.training.train_ppo
+python -m drone_training.src.training.train_sac</code></pre>
         </div>
       </div>
     </section>
@@ -111,7 +111,7 @@ python3 random_policy.py</code></pre>
 
   <footer class="footer">
     <div class="container">
-      <p>Intro to Robot Learning Project • Leo Shaw</p>
+      <p>Intro to Robot Learning Project - Leo Shaw and Siddarth Ashok</p>
     </div>
   </footer>
 </body>
