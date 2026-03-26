@@ -1,0 +1,10 @@
+{
+  "source_step": 42598400,
+  "source_checkpoint": "/home/sid/Intro-to-Robot-Learning-/drone_training/artifacts/playground_ppo/DroneMJX-20260324-182737/checkpoints/000042598400",
+  "eval_reward": 136.47274780273438,
+  "eval_success": 0.3203125,
+  "eval_final_distance_to_goal": 1.8798707723617554,
+  "eval_best_distance_to_goal": 1.6917188167572021,
+  "eval_distance_to_goal_per_step": 2.1515403035640275,
+  "eval_numerical_issue": 0.0
+}

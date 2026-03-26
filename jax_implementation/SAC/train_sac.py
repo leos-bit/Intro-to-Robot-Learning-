@@ -16,21 +16,17 @@ from typing import Any
 
 from brax.training.agents.sac import networks as sac_networks
 from brax.training.agents.sac import train as sac
-from brax.envs import base as brax_envs
 import jax
 import jax.numpy as jp
 from ml_collections import config_dict
+from mujoco_playground import wrapper
+from mujoco_playground._src import mjx_env
 import numpy as np
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from jax_implementation.SAC.sac_config import (
-    DEFAULT_LOG_ROOT,
-    default_env_overrides,
-    default_sac_overrides,
-)
 from jax_implementation.env import default_config, newDrone
 try:
     from tqdm import tqdm
@@ -41,6 +37,63 @@ try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
+
+try:
+    from jax_implementation.SAC.sac_config import (
+        DEFAULT_LOG_ROOT,
+        default_env_overrides,
+        default_sac_overrides,
+    )
+except Exception:
+    DEFAULT_LOG_ROOT = "jax_implementation/SAC/artifacts"
+
+    def default_env_overrides() -> config_dict.ConfigDict:
+        """Built-in environment overrides when sac_config.py is unavailable."""
+        return config_dict.ConfigDict(
+            dict(
+                xylim=6.0,
+                zlim=3.5,
+                vellim=1.5,
+                yawrate_lim=0.7,
+                action_scale=1.0,
+                spawn_z_min=0.8,
+                target_dist_min=0.8,
+                target_dist_max=3.5,
+                collision_terminate_steps=12,
+                eps_goal=0.35,
+                safety_speed_scale=5.0,
+                max_active_obstacles=15,
+            )
+        )
+
+    def default_sac_overrides() -> config_dict.ConfigDict:
+        """Built-in SAC defaults when sac_config.py is unavailable."""
+        return config_dict.ConfigDict(
+            dict(
+                num_timesteps=60_000_000,
+                num_evals=20,
+                reward_scaling=1.0,
+                episode_length=2_000,
+                normalize_observations=True,
+                deterministic_eval=True,
+                action_repeat=1,
+                discounting=0.99,
+                learning_rate=3e-4,
+                num_envs=1_024,
+                num_eval_envs=128,
+                batch_size=2_048,
+                tau=0.005,
+                min_replay_size=65_536,
+                max_replay_size=1_000_000,
+                grad_updates_per_step=1,
+                run_evals=True,
+                network_factory=dict(
+                    hidden_layer_sizes=[1024, 1024],
+                    policy_network_layer_norm=False,
+                    q_network_layer_norm=False,
+                ),
+            )
+        )
 
 
 def _rscope_summary_fn(full_states, obs, rew, done):
@@ -78,10 +131,10 @@ def _default_sac_cfg() -> config_dict.ConfigDict:
     return cfg
 
 
-class StateObsWrapper(brax_envs.Wrapper):
+class StateObsWrapper(wrapper.Wrapper):
     """Convert dict observations from Drone_env into a single flat vector."""
 
-    def __init__(self, env: brax_envs.Env):
+    def __init__(self, env: mjx_env.MjxEnv):
         super().__init__(env)
         self._model_assets = env.model_assets
         if hasattr(env, "obs_spec"):
@@ -126,11 +179,11 @@ class StateObsWrapper(brax_envs.Wrapper):
             axis=-1,
         )
 
-    def reset(self, rng: jax.Array) -> brax_envs.State:
+    def reset(self, rng: jax.Array) -> mjx_env.State:
         state = self.env.reset(rng)
         return state.replace(obs=self._pack_obs(state.obs))
 
-    def step(self, state: brax_envs.State, action: jax.Array) -> brax_envs.State:
+    def step(self, state: mjx_env.State, action: jax.Array) -> mjx_env.State:
         state = self.env.step(state, action)
         return state.replace(obs=self._pack_obs(state.obs))
 
@@ -224,10 +277,23 @@ def _apply_env_overrides(env_cfg: config_dict.ConfigDict, overrides_json: str | 
     if not isinstance(overrides, dict):
         raise ValueError("--env_overrides must decode to a JSON object/dict.")
     for key, value in overrides.items():
-        current_value = env_cfg.get(key, None)
-        if isinstance(current_value, jax.Array):
-            value = jp.asarray(value, dtype=current_value.dtype)
-        env_cfg[key] = value
+        env_cfg[key] = _coerce_env_override_value(env_cfg.get(key, None), value)
+
+
+def _coerce_env_override_value(current_value: Any, value: Any) -> Any:
+    """Coerce override values to the existing config field type when safe."""
+    if isinstance(current_value, jax.Array):
+        return jp.asarray(value, dtype=current_value.dtype)
+    if isinstance(current_value, bool):
+        return bool(value)
+    if isinstance(current_value, int) and not isinstance(current_value, bool):
+        if isinstance(value, (int, np.integer)) and not isinstance(value, bool):
+            return int(value)
+        return value
+    if isinstance(current_value, float):
+        if isinstance(value, (int, float, np.integer, np.floating)) and not isinstance(value, bool):
+            return float(value)
+    return value
 
 
 def _make_env_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
@@ -236,7 +302,7 @@ def _make_env_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
     env_cfg.max_steps = args.episode_length
     env_cfg.episode_length = args.episode_length
     for key, value in default_env_overrides().items():
-        env_cfg[key] = value
+        env_cfg[key] = _coerce_env_override_value(env_cfg.get(key, None), value)
     _apply_env_overrides(env_cfg, args.env_overrides)
     return env_cfg
 
@@ -352,6 +418,9 @@ def _validate_train_configs(
 
 def _checkpoint_rank(metrics: dict[str, Any]) -> tuple[float, float, float]:
     """Rank checkpoints by success, then final goal distance, then eval reward."""
+    numerical_issue = _safe_float_scalar(metrics.get("eval/episode_numerical_issue"))
+    if numerical_issue is not None and numerical_issue > 0.0:
+        return (float("-inf"), float("-inf"), float("-inf"))
     success = _safe_float_scalar(metrics.get("eval/episode_success"))
     final_distance = _safe_float_scalar(metrics.get("eval/episode_final_distance_to_goal"))
     reward = _safe_float_scalar(metrics.get("eval/episode_reward"))
@@ -389,6 +458,9 @@ def _save_best_checkpoint(
         ),
         "eval_distance_to_goal_per_step": _safe_float_scalar(
             metrics.get("eval/episode_distance_to_goal_per_step")
+        ),
+        "eval_numerical_issue": _safe_float_scalar(
+            metrics.get("eval/episode_numerical_issue")
         ),
     }
     best_meta_path.write_text(json.dumps(best_meta, indent=2), encoding="utf-8")
@@ -679,6 +751,12 @@ def train(args: argparse.Namespace):
         checkpoint_logdir=str(ckpt_dir),
         wrap_env=True,
     )
+    if supported_train_args and "wrap_env_fn" not in supported_train_args:
+        raise RuntimeError(
+            "Installed brax.training SAC does not support custom wrap_env_fn, "
+            "which is required for MuJoCo Playground MJX envs."
+        )
+    train_fn_kwargs["wrap_env_fn"] = wrapper.wrap_for_brax_training
     if (not supported_train_args) or ("num_eval_envs" in supported_train_args):
         train_fn_kwargs["num_eval_envs"] = num_eval_envs
     train_fn = functools.partial(sac.train, **train_fn_kwargs)

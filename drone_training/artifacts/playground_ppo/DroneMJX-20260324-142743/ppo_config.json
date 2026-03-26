@@ -1,0 +1,36 @@
+{
+  "action_repeat": 1,
+  "batch_size": 2048,
+  "clipping_epsilon": 0.2,
+  "discounting": 0.99,
+  "entropy_cost": 0.02,
+  "episode_length": 5000,
+  "gae_lambda": 0.95,
+  "learning_rate": 0.0003,
+  "log_training_metrics": true,
+  "max_grad_norm": 1.0,
+  "network_factory": {
+    "policy_hidden_layer_sizes": [
+      1024,
+      1024
+    ],
+    "policy_obs_key": "state",
+    "value_hidden_layer_sizes": [
+      1024,
+      1024
+    ],
+    "value_obs_key": "state"
+  },
+  "normalize_observations": true,
+  "num_envs": 1024,
+  "num_eval_envs": 128,
+  "num_evals": 20,
+  "num_minibatches": 16,
+  "num_timesteps": 80000000,
+  "num_updates_per_batch": 8,
+  "reward_scaling": 1.0,
+  "run_evals": true,
+  "training_metrics_steps": 50000,
+  "unroll_length": 10,
+  "use_pmap_on_reset": true
+}

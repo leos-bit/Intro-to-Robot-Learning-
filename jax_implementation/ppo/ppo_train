@@ -22,7 +22,7 @@ from ml_collections import config_dict
 from mujoco_playground import wrapper
 from mujoco_playground._src import mjx_env
 import numpy as np
-
+import rscope
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -72,7 +72,7 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
     return config_dict.ConfigDict(
         dict(
          
-            num_timesteps=60_000_000,
+            num_timesteps=80_000_000,
             num_evals=20,
             reward_scaling=1.0,
             episode_length=5000,
@@ -85,7 +85,7 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
             num_updates_per_batch=8,
             discounting=0.99,
             learning_rate=3e-4,
-            entropy_cost=1e-2,
+            entropy_cost=2e-2,
             # Scaled num_envs for GPU parallelism
             num_envs=1024,
             num_eval_envs=128,
@@ -98,8 +98,8 @@ def _default_ppo_cfg() -> config_dict.ConfigDict:
             training_metrics_steps=50_000,
             network_factory=config_dict.ConfigDict(
                 dict(
-                    policy_hidden_layer_sizes=[512, 512],
-                    value_hidden_layer_sizes=[512, 512],
+                    policy_hidden_layer_sizes=[1024, 1024],
+                    value_hidden_layer_sizes=[1024, 1024],
                     policy_obs_key="state",
                     value_obs_key="state",
                 )
@@ -416,6 +416,9 @@ def _validate_train_configs(
 
 def _checkpoint_rank(metrics: dict[str, Any]) -> tuple[float, float, float]:
     """Rank checkpoints by success, then final goal distance, then eval reward."""
+    numerical_issue = _safe_float_scalar(metrics.get("eval/episode_numerical_issue"))
+    if numerical_issue is not None and numerical_issue > 0.0:
+        return (float("-inf"), float("-inf"), float("-inf"))
     success = _safe_float_scalar(metrics.get("eval/episode_success"))
     final_distance = _safe_float_scalar(metrics.get("eval/episode_final_distance_to_goal"))
     reward = _safe_float_scalar(metrics.get("eval/episode_reward"))
@@ -453,6 +456,9 @@ def _save_best_checkpoint(
         ),
         "eval_distance_to_goal_per_step": _safe_float_scalar(
             metrics.get("eval/episode_distance_to_goal_per_step")
+        ),
+        "eval_numerical_issue": _safe_float_scalar(
+            metrics.get("eval/episode_numerical_issue")
         ),
     }
     best_meta_path.write_text(json.dumps(best_meta, indent=2), encoding="utf-8")

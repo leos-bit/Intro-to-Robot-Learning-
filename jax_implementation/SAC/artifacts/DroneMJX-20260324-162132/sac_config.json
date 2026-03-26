@@ -1,0 +1,27 @@
+{
+  "action_repeat": 1,
+  "batch_size": 2048,
+  "deterministic_eval": true,
+  "discounting": 0.99,
+  "episode_length": 2000,
+  "grad_updates_per_step": 1,
+  "learning_rate": 0.0003,
+  "max_replay_size": 1000000,
+  "min_replay_size": 65536,
+  "network_factory": {
+    "hidden_layer_sizes": [
+      1024,
+      1024
+    ],
+    "policy_network_layer_norm": false,
+    "q_network_layer_norm": false
+  },
+  "normalize_observations": true,
+  "num_envs": 1024,
+  "num_eval_envs": 128,
+  "num_evals": 20,
+  "num_timesteps": 60000000,
+  "reward_scaling": 1.0,
+  "run_evals": true,
+  "tau": 0.005
+}
