@@ -27,7 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from jax_implementation.env import default_config, newDrone
+from jax_implementation.env import default_config, newDrone, sync_config_gain_arr
 try:
     from tqdm import tqdm
 except ImportError:
@@ -53,8 +53,8 @@ except Exception:
             dict(
                 xylim=6.0,
                 zlim=3.5,
-                vellim=1.5,
-                yawrate_lim=0.7,
+                vellim=2.5,
+                yawrate_lim=1.0,
                 action_scale=1.0,
                 spawn_z_min=0.8,
                 target_dist_min=0.8,
@@ -62,7 +62,16 @@ except Exception:
                 collision_terminate_steps=12,
                 eps_goal=0.35,
                 safety_speed_scale=5.0,
-                max_active_obstacles=15,
+                landing_radius=0.9,
+                landing_xy_speed=0.9,
+                landing_z_speed=0.6,
+                max_tilt=0.45,
+                w_obs=0.25,
+                w_goal_path_clear=12.0,
+                goal_path_clearance_margin=0.25,
+                lidar_warn_dist=1.4,
+                obstacle_safe_dist=0.6,
+                max_active_obstacles=12,
             )
         )
 
@@ -304,7 +313,7 @@ def _make_env_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
     for key, value in default_env_overrides().items():
         env_cfg[key] = _coerce_env_override_value(env_cfg.get(key, None), value)
     _apply_env_overrides(env_cfg, args.env_overrides)
-    return env_cfg
+    return sync_config_gain_arr(env_cfg)
 
 
 def _make_sac_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:

@@ -27,7 +27,7 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from jax_implementation.env import default_config, newDrone
+from jax_implementation.env import default_config, newDrone, sync_config_gain_arr
 try:
     from tqdm import tqdm
 except ImportError:
@@ -303,7 +303,7 @@ def _make_env_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:
     env_cfg.max_steps = args.episode_length
     env_cfg.episode_length = args.episode_length
     _apply_env_overrides(env_cfg, args.env_overrides)
-    return env_cfg
+    return sync_config_gain_arr(env_cfg)
 
 
 def _make_ppo_cfg(args: argparse.Namespace) -> config_dict.ConfigDict:

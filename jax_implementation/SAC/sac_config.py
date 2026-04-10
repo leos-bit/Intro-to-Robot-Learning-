@@ -14,8 +14,8 @@ def default_env_overrides() -> config_dict.ConfigDict:
         dict(
             xylim=6.0,
             zlim=3.5,
-            vellim=1.5,
-            yawrate_lim=0.7,
+            vellim=2.5,
+            yawrate_lim=1.0,
             action_scale=1.0,
             spawn_z_min=0.8,
             target_dist_min=0.8,
@@ -23,7 +23,16 @@ def default_env_overrides() -> config_dict.ConfigDict:
             collision_terminate_steps=12,
             eps_goal=0.35,
             safety_speed_scale=5.0,
-            max_active_obstacles=15,
+            landing_radius=0.9,
+            landing_xy_speed=0.9,
+            landing_z_speed=0.6,
+            max_tilt=0.45,
+            w_obs=0.25,
+            w_goal_path_clear=12.0,
+            goal_path_clearance_margin=0.25,
+            lidar_warn_dist=1.4,
+            obstacle_safe_dist=0.6,
+            max_active_obstacles=12,
         )
     )
 

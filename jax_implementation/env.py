@@ -35,6 +35,33 @@ def _softmin(x: jax.Array, temperature: float) -> jax.Array:
     tau = jp.asarray(max(float(temperature), 1e-3), dtype=jp.float32)
     return -tau * jax.nn.logsumexp(-x / tau)
 
+
+def _gain_array_from_config(cfg: config_dict.ConfigDict) -> jax.Array:
+    """Build the controller gain vector from scalar config fields."""
+    return jp.array(
+        [
+            float(cfg.get("k_xy", 0.55)),
+            float(cfg.get("ki_xy", 0.0)),
+            float(cfg.get("kd_xy", 0.35)),
+            float(cfg.get("k_z", 1.2)),
+            float(cfg.get("ki_z", 0.0)),
+            float(cfg.get("kd_z", 0.2)),
+            float(cfg.get("k_yaw", 0.35)),
+            float(cfg.get("ki_yaw", 0.0)),
+            float(cfg.get("kd_yaw", 0.35)),
+            float(cfg.get("kp_att", 4.5)),
+            float(cfg.get("kd_att", 0.45)),
+            float(cfg.get("ki_att", 0.0)),
+        ],
+        dtype=jp.float32,
+    )
+
+
+def sync_config_gain_arr(cfg: config_dict.ConfigDict) -> config_dict.ConfigDict:
+    """Keep gain_arr consistent with scalar gain overrides."""
+    cfg.gain_arr = _gain_array_from_config(cfg)
+    return cfg
+
 def default_config() -> config_dict.ConfigDict:
       cfg = config_dict.create(
         ctrl_dt=0.01,
@@ -48,7 +75,7 @@ def default_config() -> config_dict.ConfigDict:
         model_path=_XML_PATH,
         xylim=10.0,
         zlim=8.0,
-        vellim=2.0,
+        vellim=2.5,
         yawrate_lim=2.0,
         action_scale=1.0,
         spawn_z_min=0.3,
@@ -59,6 +86,7 @@ def default_config() -> config_dict.ConfigDict:
         w_goal_proximity=10.0,
         goal_proximity_scale=5.0,
         w_goal_best_progress=20.0,
+        w_goal_regress=8.0,
         w_goal_hover=1.0,
         w_energy=0.01,
         w_smooth=0.02,
@@ -81,19 +109,19 @@ def default_config() -> config_dict.ConfigDict:
         # ki_att=0.4,
         # ki_yaw=0.4,
         # kd_yaw=0.3,
-        k_xy=0.25,
+        k_xy=0.55,
         k_z=1.2,
-        k_yaw=0.2,
+        k_yaw=0.35,
         ki_xy=0.0,
         ki_z=0.00,
-        kd_xy=2,
-        kd_z=2,
-        kp_att=3.0,
-        kd_att=2,
+        kd_xy=0.35,
+        kd_z=0.2,
+        kp_att=4.5,
+        kd_att=0.45,
         ki_att=0.0,
         ki_yaw=0.0,
-        kd_yaw=2.0,
-        max_tilt=0.25,
+        kd_yaw=0.35,
+        max_tilt=0.45,
         collective_limit=2.0,
         attitude_limit=1.2,
         yaw_limit=0.7,
@@ -105,9 +133,9 @@ def default_config() -> config_dict.ConfigDict:
         yaw_hold_epsilon=0.1,
         hover_speed_epsilon=0.25,
         hover_success_steps=10,
-        landing_radius=2.0,
-        landing_xy_speed=0.35,
-        landing_z_speed=0.25,
+        landing_radius=0.9,
+        landing_xy_speed=0.9,
+        landing_z_speed=0.6,
         landing_xy_damping=1.0,
         landing_z_damping=0.8,
         safety_xy_scale=1.5,
@@ -122,30 +150,18 @@ def default_config() -> config_dict.ConfigDict:
         obstacle_target_clearance=0.8,
         obstacle_min_separation=0.8,
         obstacle_sample_margin=0.6,
-        w_obs=0.5,
-        lidar_warn_dist=2.0,
-        obstacle_safe_dist=0.8,
+        w_obs=0.25,
+        w_goal_path_clear=12.0,
+        goal_path_clearance_margin=0.25,
+        lidar_warn_dist=1.4,
+        obstacle_safe_dist=0.6,
         lidar_softmin_tau=0.5,
         lidar_risk_weight=0.5,
         true_obstacle_risk_weight=1.0,
         drone_clearance_radius=0.25,
         obstacle_radius=0.2,
       )
-      cfg.gain_arr = jp.array([
-          cfg.k_xy,
-          cfg.ki_xy,
-          cfg.kd_xy,
-          cfg.k_z,
-          cfg.ki_z,
-          cfg.kd_z,
-          cfg.k_yaw,
-          cfg.ki_yaw,
-          cfg.kd_yaw,
-          cfg.kp_att,
-          cfg.kd_att,
-          cfg.ki_att,
-      ])
-      return cfg
+      return sync_config_gain_arr(cfg)
 
 
 
@@ -190,8 +206,17 @@ class newDrone(mjx_env.MjxEnv):
             self.w_goal_best_progress = float(
                 max(0.0, float(self._config.get("w_goal_best_progress", 0.0)))
             )
+            self.w_goal_regress = float(
+                max(0.0, float(self._config.get("w_goal_regress", 0.0)))
+            )
             self.w_goal_hover = float(
                 max(0.0, float(self._config.get("w_goal_hover", 0.0)))
+            )
+            self.w_goal_path_clear = float(
+                max(0.0, float(self._config.get("w_goal_path_clear", 0.0)))
+            )
+            self.goal_path_clearance_margin = float(
+                max(0.0, float(self._config.get("goal_path_clearance_margin", 0.0)))
             )
             self.w_energy = float(max(0.0, float(self._config.w_energy)))
             self.w_smooth = float(max(0.0, float(self._config.w_smooth)))
@@ -235,7 +260,8 @@ class newDrone(mjx_env.MjxEnv):
             # self.kp_pos_xy = float(max(0.0, float(self._config.kp_pos_xy)))
             # self.kp_pos_z = float(max(0.0, float(self._config.kp_pos_z)))
             # self.kp_pos_yaw = float(max(0.0, float(self._config.kp_pos_yaw)))
-            self.gain_arr = jp.asarray(self._config.get("gain_arr"))
+            sync_config_gain_arr(self._config)
+            self.gain_arr = jp.asarray(self._config.get("gain_arr"), dtype=jp.float32)
             self.position_hold_epsilon = float(max(0.0, float(self._config.position_hold_epsilon)))
             self.yaw_hold_epsilon = float(max(0.0, float(self._config.yaw_hold_epsilon)))
             self.hover_speed_epsilon = float(
@@ -818,6 +844,36 @@ class newDrone(mjx_env.MjxEnv):
             jp.asarray(obstacle_risk, dtype=jp.float32),
         )
 
+    def _goal_path_risk(
+        self,
+        agent_location: jax.Array,
+        target: jax.Array,
+        obstacle_positions: jax.Array,
+        obstacle_mask: jax.Array,
+    ) -> jax.Array:
+        if self.max_obstacles == 0:
+            return jp.array(0.0, dtype=jp.float32)
+
+        obstacle_mask = jp.asarray(obstacle_mask, dtype=jp.bool_)
+        goal_vec_xy = jp.asarray(target[:2] - agent_location[:2], dtype=jp.float32)
+        goal_dist_xy = _safe_l2_norm(goal_vec_xy)
+        goal_dir_xy = goal_vec_xy / jp.maximum(goal_dist_xy, 1e-6)
+        rel_xy = obstacle_positions[:, :2] - agent_location[None, :2]
+        along = jp.sum(rel_xy * goal_dir_xy[None, :], axis=-1)
+        lateral_vec = rel_xy - (along[:, None] * goal_dir_xy[None, :])
+        lateral = _safe_l2_norm(lateral_vec, axis=-1)
+        corridor_radius = jp.asarray(
+            self.drone_clearance_radius + self.obstacle_radius + self.goal_path_clearance_margin,
+            dtype=jp.float32,
+        )
+        between = obstacle_mask & (along > 0.0) & (along < goal_dist_xy)
+        shortfall = jp.where(
+            between,
+            jp.maximum(0.0, corridor_radius - lateral),
+            0.0,
+        )
+        return jp.asarray(jp.max(shortfall), dtype=jp.float32)
+
     def _get_info(self, agent_location: jax.Array, target: jax.Array, initial_distance: jax.Array):
         distance = jp.linalg.norm(agent_location - target)
         return {
@@ -890,6 +946,12 @@ class newDrone(mjx_env.MjxEnv):
             obstacle_positions,
             obstacle_mask,
         )
+        goal_path_risk = self._goal_path_risk(
+            agent_location,
+            target,
+            obstacle_positions,
+            obstacle_mask,
+        )
 
         info = {
             "rng": rng,
@@ -920,12 +982,16 @@ class newDrone(mjx_env.MjxEnv):
             "num_active": num_active.astype(jp.int32),
             "prev_obstacle_risk": obstacle_risk,
             "obstacle_risk": obstacle_risk,
+            "prev_goal_path_risk": goal_path_risk,
+            "goal_path_risk": goal_path_risk,
             "lidar_clearance": lidar_clearance,
             "true_obstacle_clearance": true_obstacle_clearance,
             "r_prog": jp.array(0.0, dtype=jp.float32),
             "r_goal_prox": jp.array(0.0, dtype=jp.float32),
             "r_goal_best": jp.array(0.0, dtype=jp.float32),
+            "r_goal_regress": jp.array(0.0, dtype=jp.float32),
             "r_goal_hover": jp.array(0.0, dtype=jp.float32),
+            "r_goal_path": jp.array(0.0, dtype=jp.float32),
             "r_obs": jp.array(0.0, dtype=jp.float32),
             "r_coll": jp.array(0.0, dtype=jp.float32),
             "r_energy": jp.array(0.0, dtype=jp.float32),
@@ -977,7 +1043,9 @@ class newDrone(mjx_env.MjxEnv):
             "r_prog": zero,
             "r_goal_prox": zero,
             "r_goal_best": zero,
+            "r_goal_regress": zero,
             "r_goal_hover": zero,
+            "r_goal_path": zero,
             "r_obs": zero,
             "r_coll": zero,
             "r_energy": zero,
@@ -985,6 +1053,7 @@ class newDrone(mjx_env.MjxEnv):
             "r_safety": zero,
             "r_speed": zero,
             "r_terminal": zero,
+            "goal_path_risk": zero,
             "lidar_clearance": jp.asarray(self.lidar_max_dist, dtype=jp.float32),
             "true_obstacle_clearance": jp.asarray(self.lidar_max_dist, dtype=jp.float32),
             "raw_action_l2": zero,
@@ -1061,6 +1130,16 @@ class newDrone(mjx_env.MjxEnv):
         obstacle_rel = obstacle_positions - agent_location[None, :]
         obstacle_rel = jp.where(obstacle_mask[:, None] > 0.0, obstacle_rel, 0.0)
         obstacle_rel = jp.clip(obstacle_rel, self._obstacle_rel_low, self._obstacle_rel_high)
+        if self.max_obstacles > 0:
+            obstacle_xy_dist = _safe_l2_norm(obstacle_rel[:, :2], axis=-1)
+            inactive_bias = jp.where(
+                obstacle_mask > 0.0,
+                0.0,
+                jp.full_like(obstacle_xy_dist, 2.0 * self._obstacle_rel_xy_lim),
+            )
+            obstacle_order = jp.argsort(obstacle_xy_dist + inactive_bias)
+            obstacle_rel = obstacle_rel[obstacle_order]
+            obstacle_mask = obstacle_mask[obstacle_order]
         num_active = jp.clip(
             jp.asarray(info["num_active"], dtype=jp.float32).reshape((1,)),
             0.0,
@@ -1610,7 +1689,14 @@ class newDrone(mjx_env.MjxEnv):
             info["obstacle_positions"],
             info["obstacle_mask"],
         )
+        goal_path_risk = self._goal_path_risk(
+            info["agent_location"],
+            info["target"],
+            info["obstacle_positions"],
+            info["obstacle_mask"],
+        )
         r_obs = self.w_obs * (info["prev_obstacle_risk"] - obstacle_risk)
+        r_goal_path = self.w_goal_path_clear * (info["prev_goal_path_risk"] - goal_path_risk)
         r_coll = jp.where(collision, -self.r_collision, 0.0)
         r_energy = -self.w_energy * jp.dot(scaled_action, scaled_action)
         r_smooth = -self.w_smooth * jp.dot(delta_action, delta_action)
@@ -1618,6 +1704,17 @@ class newDrone(mjx_env.MjxEnv):
         r_goal_best = self.w_goal_best_progress * (
             info["min_distance_to_goal"] - min_distance_to_goal
         )
+        min_goal_near_frac = jp.clip(
+            1.0
+            - (
+                info["min_distance_to_goal"]
+                / jp.asarray(self.goal_proximity_scale, dtype=jp.float32)
+            ),
+            0.0,
+            1.0,
+        )
+        goal_regress = jp.maximum(0.0, dist - info["min_distance_to_goal"])
+        r_goal_regress = -self.w_goal_regress * min_goal_near_frac * goal_regress
         # Reward getting deeper into the local goal basin, not merely staying in it.
         # This makes drifting away from the goal produce a negative shaping signal.
         prev_goal_near_frac = jp.clip(
@@ -1647,7 +1744,16 @@ class newDrone(mjx_env.MjxEnv):
         r_safety = jp.where(safety_terminated, -self.r_collision, 0.0)
         r_speed = -self.w_speed * speed_sq
 
-        reward = r_prog + r_obs + r_coll + r_energy + r_smooth + r_safety + r_speed
+        reward = (
+            r_prog
+            + r_obs
+            + r_goal_path
+            + r_coll
+            + r_energy
+            + r_smooth
+            + r_safety
+            + r_speed
+        )
         hovering_at_goal = (dist <= self.eps_goal) & (
             speed_sq <= jp.square(self.hover_speed_epsilon)
         )
@@ -1669,7 +1775,7 @@ class newDrone(mjx_env.MjxEnv):
             -(self.termination_penalty + self.terminal_distance_penalty * dist),
             0.0,
         )
-        reward = reward + r_goal_prox + r_goal_best + r_goal_hover + r_terminal
+        reward = reward + r_goal_prox + r_goal_best + r_goal_regress + r_goal_hover + r_terminal
         episode_end = terminated | truncated
 
         invalid_reward = (-2.0 * self.r_collision) - self.termination_penalty
@@ -1713,7 +1819,9 @@ class newDrone(mjx_env.MjxEnv):
             "r_prog": to_f32(jp.where(invalid_state, 0.0, r_prog)),
             "r_goal_prox": to_f32(jp.where(invalid_state, 0.0, r_goal_prox)),
             "r_goal_best": to_f32(jp.where(invalid_state, 0.0, r_goal_best)),
+            "r_goal_regress": to_f32(jp.where(invalid_state, 0.0, r_goal_regress)),
             "r_goal_hover": to_f32(jp.where(invalid_state, 0.0, r_goal_hover)),
+            "r_goal_path": to_f32(jp.where(invalid_state, 0.0, r_goal_path)),
             "r_obs": to_f32(jp.where(invalid_state, 0.0, r_obs)),
             "r_coll": to_f32(jp.where(invalid_state, -2.0 * self.r_collision, r_coll)),
             "r_energy": to_f32(jp.where(invalid_state, 0.0, r_energy)),
@@ -1721,6 +1829,9 @@ class newDrone(mjx_env.MjxEnv):
             "r_safety": to_f32(jp.where(invalid_state, 0.0, r_safety)),
             "r_speed": to_f32(jp.where(invalid_state, 0.0, r_speed)),
             "r_terminal": to_f32(jp.where(invalid_state, -self.termination_penalty, r_terminal)),
+            "goal_path_risk": to_f32(
+                jp.where(invalid_state, info["goal_path_risk"], goal_path_risk)
+            ),
             "lidar_clearance": to_f32(
                 jp.where(invalid_state, info["lidar_clearance"], lidar_clearance)
             ),
@@ -1773,12 +1884,20 @@ class newDrone(mjx_env.MjxEnv):
                 obstacle_risk,
             ),
             "obstacle_risk": jp.where(invalid_state, info["obstacle_risk"], obstacle_risk),
+            "prev_goal_path_risk": jp.where(
+                invalid_state,
+                info["prev_goal_path_risk"],
+                goal_path_risk,
+            ),
+            "goal_path_risk": metrics["goal_path_risk"],
             "lidar_clearance": metrics["lidar_clearance"],
             "true_obstacle_clearance": metrics["true_obstacle_clearance"],
             "r_prog": metrics["r_prog"],
             "r_goal_prox": metrics["r_goal_prox"],
             "r_goal_best": metrics["r_goal_best"],
+            "r_goal_regress": metrics["r_goal_regress"],
             "r_goal_hover": metrics["r_goal_hover"],
+            "r_goal_path": metrics["r_goal_path"],
             "r_obs": metrics["r_obs"],
             "r_coll": metrics["r_coll"],
             "r_energy": metrics["r_energy"],
