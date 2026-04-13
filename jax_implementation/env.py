@@ -64,7 +64,7 @@ def sync_config_gain_arr(cfg: config_dict.ConfigDict) -> config_dict.ConfigDict:
 
 def default_config() -> config_dict.ConfigDict:
       cfg = config_dict.create(
-        ctrl_dt=0.01,
+        ctrl_dt=0.001,
         sim_dt=0.001,
         solver_iterations=None,
         episode_length=5000,
