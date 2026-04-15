@@ -74,6 +74,26 @@ def _build_obs_layout(env: newDrone, obs_keys: tuple[str, ...]) -> dict[str, dic
     return layout
 
 
+def _jsonable_value(value: Any) -> Any:
+    """Recursively convert JAX/NumPy values into JSON-safe Python types."""
+    if isinstance(value, dict):
+        return {str(key): _jsonable_value(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable_value(item) for item in value]
+    if isinstance(value, jax.Array):
+        arr = np.asarray(jax.device_get(value))
+        if arr.ndim == 0:
+            return arr.item()
+        return arr.tolist()
+    if isinstance(value, np.ndarray):
+        if value.ndim == 0:
+            return value.item()
+        return value.tolist()
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
 def _make_action_sampler(
     env: newDrone,
     policy: str,
@@ -217,7 +237,7 @@ def collect_parallel_rollouts(
         "action_high": np.asarray(jax.device_get(env.action_high), dtype=np.float32).tolist(),
         "lidar_key": "lidar" if "lidar" in obs_layout else None,
         "lidar_slice": obs_layout.get("lidar"),
-        "env_config": dict(env._config.to_dict()),
+        "env_config": _jsonable_value(dict(env._config.to_dict())),
     }
     return dataset, metadata, elapsed
 
@@ -237,7 +257,10 @@ def save_dataset(
     meta_path = out_path / f"{save_stem}.json"
 
     np.savez(dataset_path, **dataset)
-    meta_path.write_text(json.dumps(metadata, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    meta_path.write_text(
+        json.dumps(_jsonable_value(metadata), indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
     return dataset_path, meta_path
 
 
@@ -290,7 +313,7 @@ def main() -> None:
         action_noise_std=args.action_noise_std,
     )
     if applied_overrides:
-        metadata["applied_env_overrides"] = applied_overrides
+        metadata["applied_env_overrides"] = applied_overrides.to_list()
 
     dataset_path, meta_path = save_dataset(
         dataset=dataset,
