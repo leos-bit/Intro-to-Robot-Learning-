@@ -332,6 +332,10 @@ class TransitionBatchLoader:
         y = (y - self.y_mean) / self.y_std
         return x.astype(np.float32, copy=False), y.astype(np.float32, copy=False)
 
+    def sample_batch(self) -> tuple[np.ndarray, np.ndarray]:
+        batch_ids = self.rng.integers(0, self.size, size=self.batch_size, dtype=np.int64)
+        return self._gather_batch(batch_ids)
+
     def __iter__(self):
         if self.shuffle:
             # Avoid materializing a full permutation over millions of transitions.
@@ -397,7 +401,10 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ensemble_size", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=4096)
-    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--steps_per_epoch", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--eval_every", type=int, default=5)
+    parser.add_argument("--val_batches", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument(
         "--save_dir",
@@ -524,6 +531,11 @@ if __name__ == "__main__":
     E = args.ensemble_size
     model = EnsembleDynamics(ensemble_size=E)
     y_std = jnp.asarray(norm_stats["y_std"], dtype=jnp.float32)
+
+    if args.steps_per_epoch <= 0:
+        raise ValueError("--steps_per_epoch must be positive.")
+    if args.eval_every <= 0:
+        raise ValueError("--eval_every must be positive.")
     
     dummy_x = jnp.zeros((E, 1, obs_dim + action_dim), dtype=jnp.float32)
     params = model.init(jax.random.PRNGKey(0), dummy_x)["params"]
@@ -550,7 +562,8 @@ if __name__ == "__main__":
         train_raw_reward_mse_sum = 0.0
         num_train_batches = 0
 
-        for member_batches in zip(*train_loaders):
+        for _ in range(args.steps_per_epoch):
+            member_batches = [loader.sample_batch() for loader in train_loaders]
             batch_x = jnp.asarray(np.stack([bx for bx, _ in member_batches], axis=0), dtype=jnp.float32)
             batch_y = jnp.asarray(np.stack([by for _, by in member_batches], axis=0), dtype=jnp.float32)
 
@@ -571,37 +584,49 @@ if __name__ == "__main__":
         mean_train_raw_delta_mse = train_raw_delta_mse_sum / max(num_train_batches, 1)
         mean_train_raw_reward_mse = train_raw_reward_mse_sum / max(num_train_batches, 1)
 
-        val_loss_sum = 0.0
-        val_loss_per_model_sum = np.zeros((E,), dtype=np.float64)
-        val_mse_sum = 0.0
-        val_raw_mse_sum = 0.0
-        val_raw_delta_mse_sum = 0.0
-        val_raw_reward_mse_sum = 0.0
-        num_val_batches = 0
+        should_eval = (epoch % args.eval_every == 0) or (epoch == args.epochs)
+        mean_val_loss = None
+        mean_val_loss_per_model = None
+        mean_val_mse = None
+        mean_val_raw_mse = None
+        mean_val_raw_delta_mse = None
+        mean_val_raw_reward_mse = None
 
-        for bx, by in test_loader:
-            bx = jnp.asarray(bx, dtype=jnp.float32)
-            by = jnp.asarray(by, dtype=jnp.float32)
+        if should_eval:
+            val_loss_sum = 0.0
+            val_loss_per_model_sum = np.zeros((E,), dtype=np.float64)
+            val_mse_sum = 0.0
+            val_raw_mse_sum = 0.0
+            val_raw_delta_mse_sum = 0.0
+            val_raw_reward_mse_sum = 0.0
+            num_val_batches = 0
 
-            bx = jnp.broadcast_to(bx[None], (E, *bx.shape))
-            by = jnp.broadcast_to(by[None], (E, *by.shape))
+            for batch_id, (bx, by) in enumerate(test_loader, start=1):
+                bx = jnp.asarray(bx, dtype=jnp.float32)
+                by = jnp.asarray(by, dtype=jnp.float32)
 
-            val_metrics = eval_step(state.params, state.apply_fn, bx, by, y_std)
-            val_metrics = jax.device_get(val_metrics)
-            val_loss_sum += float(val_metrics["loss"])
-            val_loss_per_model_sum += np.asarray(val_metrics["loss_per_model"], dtype=np.float64)
-            val_mse_sum += float(val_metrics["mse"])
-            val_raw_mse_sum += float(val_metrics["raw_mse"])
-            val_raw_delta_mse_sum += float(val_metrics["raw_delta_mse"])
-            val_raw_reward_mse_sum += float(val_metrics["raw_reward_mse"])
-            num_val_batches += 1
+                bx = jnp.broadcast_to(bx[None], (E, *bx.shape))
+                by = jnp.broadcast_to(by[None], (E, *by.shape))
 
-        mean_val_loss = val_loss_sum / max(num_val_batches, 1)
-        mean_val_loss_per_model = val_loss_per_model_sum / max(num_val_batches, 1)
-        mean_val_mse = val_mse_sum / max(num_val_batches, 1)
-        mean_val_raw_mse = val_raw_mse_sum / max(num_val_batches, 1)
-        mean_val_raw_delta_mse = val_raw_delta_mse_sum / max(num_val_batches, 1)
-        mean_val_raw_reward_mse = val_raw_reward_mse_sum / max(num_val_batches, 1)
+                val_metrics = eval_step(state.params, state.apply_fn, bx, by, y_std)
+                val_metrics = jax.device_get(val_metrics)
+                val_loss_sum += float(val_metrics["loss"])
+                val_loss_per_model_sum += np.asarray(val_metrics["loss_per_model"], dtype=np.float64)
+                val_mse_sum += float(val_metrics["mse"])
+                val_raw_mse_sum += float(val_metrics["raw_mse"])
+                val_raw_delta_mse_sum += float(val_metrics["raw_delta_mse"])
+                val_raw_reward_mse_sum += float(val_metrics["raw_reward_mse"])
+                num_val_batches += 1
+
+                if args.val_batches > 0 and batch_id >= args.val_batches:
+                    break
+
+            mean_val_loss = val_loss_sum / max(num_val_batches, 1)
+            mean_val_loss_per_model = val_loss_per_model_sum / max(num_val_batches, 1)
+            mean_val_mse = val_mse_sum / max(num_val_batches, 1)
+            mean_val_raw_mse = val_raw_mse_sum / max(num_val_batches, 1)
+            mean_val_raw_delta_mse = val_raw_delta_mse_sum / max(num_val_batches, 1)
+            mean_val_raw_reward_mse = val_raw_reward_mse_sum / max(num_val_batches, 1)
 
         epoch_record = {
             "epoch": epoch,
@@ -611,27 +636,38 @@ if __name__ == "__main__":
             "train_raw_mse": float(mean_train_raw_mse),
             "train_raw_delta_mse": float(mean_train_raw_delta_mse),
             "train_raw_reward_mse": float(mean_train_raw_reward_mse),
-            "val_loss": float(mean_val_loss),
-            "val_loss_per_model": to_float_list(mean_val_loss_per_model),
-            "val_mse": float(mean_val_mse),
-            "val_raw_mse": float(mean_val_raw_mse),
-            "val_raw_delta_mse": float(mean_val_raw_delta_mse),
-            "val_raw_reward_mse": float(mean_val_raw_reward_mse),
+            "val_loss": None if mean_val_loss is None else float(mean_val_loss),
+            "val_loss_per_model": None if mean_val_loss_per_model is None else to_float_list(mean_val_loss_per_model),
+            "val_mse": None if mean_val_mse is None else float(mean_val_mse),
+            "val_raw_mse": None if mean_val_raw_mse is None else float(mean_val_raw_mse),
+            "val_raw_delta_mse": None if mean_val_raw_delta_mse is None else float(mean_val_raw_delta_mse),
+            "val_raw_reward_mse": None if mean_val_raw_reward_mse is None else float(mean_val_raw_reward_mse),
         }
         history.append(epoch_record)
 
-        print(
-            f"Epoch {epoch}/{args.epochs} | "
-            f"train_nll={mean_train_loss:.4f} | "
-            f"val_nll={mean_val_loss:.4f} | "
-            f"train_raw_mse={mean_train_raw_mse:.6f} | "
-            f"val_raw_mse={mean_val_raw_mse:.6f}"
-        )
+        if should_eval:
+            print(
+                f"Epoch {epoch}/{args.epochs} | "
+                f"train_nll={mean_train_loss:.4f} | "
+                f"val_nll={mean_val_loss:.4f} | "
+                f"train_raw_mse={mean_train_raw_mse:.6f} | "
+                f"val_raw_mse={mean_val_raw_mse:.6f} | "
+                f"train_raw_delta_mse={mean_train_raw_delta_mse:.6f} | "
+                f"val_raw_delta_mse={mean_val_raw_delta_mse:.6f}"
+            )
 
-        if mean_val_loss < best_val_loss:
-            best_val_loss = float(mean_val_loss)
-            best_epoch = epoch
-            save_params(save_dir / "best_params.msgpack", state.params)
+            if mean_val_loss < best_val_loss:
+                best_val_loss = float(mean_val_loss)
+                best_epoch = epoch
+                save_params(save_dir / "best_params.msgpack", state.params)
+        else:
+            print(
+                f"Epoch {epoch}/{args.epochs} | "
+                f"train_nll={mean_train_loss:.4f} | "
+                f"train_raw_mse={mean_train_raw_mse:.6f} | "
+                f"train_raw_delta_mse={mean_train_raw_delta_mse:.6f} | "
+                f"val=skipped"
+            )
 
     save_params(save_dir / "final_params.msgpack", state.params)
     metrics_payload = {
@@ -640,7 +676,10 @@ if __name__ == "__main__":
         "seed": int(args.seed),
         "ensemble_size": int(args.ensemble_size),
         "batch_size": int(args.batch_size),
+        "steps_per_epoch": int(args.steps_per_epoch),
         "epochs": int(args.epochs),
+        "eval_every": int(args.eval_every),
+        "val_batches": int(args.val_batches),
         "lr": float(args.lr),
         "best_epoch": int(best_epoch),
         "best_val_loss": float(best_val_loss),
