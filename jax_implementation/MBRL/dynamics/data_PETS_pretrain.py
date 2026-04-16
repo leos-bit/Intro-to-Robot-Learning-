@@ -298,6 +298,7 @@ def _build_parser() -> argparse.ArgumentParser:
     return parser
 
 
+
 def main() -> None:
     args = _build_parser().parse_args()
     cfg = default_config()
