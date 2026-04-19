@@ -4,18 +4,29 @@ from functools import partial
 from pathlib import Path
 
 import flax.linen as nn
+import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import serialization
 from flax.training import train_state
-import jax
+import optax
+
 OBS_DIM = 96
 ACTION_DIM = 4
 MAX_OBSTACLES = 15
 TARGET_DIM = OBS_DIM + 1
 STATS_CHUNK_ENVS = 8
+DEFAULT_DATA_PATH = (
+    "jax_implementation/MBRL/dyn_data/"
+    "pets_pretrain_envB512_T10000_pid_noisy_seed0.npz"
+)
+LOGVAR_REG_COEF = 1e-2
+GRAD_CLIP_NORM = 100.0
+LOGVAR_LOWER_BOUND = -10.0
+LOGVAR_UPPER_BOUND = 0.5
+LOGVAR_BOUND_EPS = 1e-6
 
-import optax
+
 class MLP(nn.Module):
     widths: tuple[int, ...] = (512, 512)
 
@@ -81,6 +92,11 @@ class DirectionAwareLidarEncoder(nn.Module):
         return MLP((64, self.out_dim))(feat)
 
 
+def _safe_l2_norm(x, axis=None, keepdims=False, eps: float = 1e-8):
+    x = jnp.asarray(x, dtype=jnp.float32)
+    return jnp.sqrt(jnp.sum(jnp.square(x), axis=axis, keepdims=keepdims) + eps)
+
+
 class MaskedObstacleEncoder(nn.Module):
     out_dim: int = 64
     max_obstacles: int = MAX_OBSTACLES
@@ -89,7 +105,7 @@ class MaskedObstacleEncoder(nn.Module):
     def __call__(self, obstacle_rel, obstacle_mask, num_active):
         mask = jnp.asarray(obstacle_mask, dtype=jnp.float32)[..., None]
         rel = jnp.asarray(obstacle_rel, dtype=jnp.float32)
-        dist = jnp.linalg.norm(rel, axis=-1, keepdims=True)
+        dist = _safe_l2_norm(rel, axis=-1, keepdims=True)
 
         per_obstacle = jnp.concatenate([rel, dist], axis=-1)
         per_obstacle = MLP((64, 64))(per_obstacle)
@@ -172,10 +188,22 @@ class Dynamics_Model(nn.Module):
         min_logvar = self.param(
             "min_logvar", nn.initializers.constant(-10.0), (self.target_dim,)
         )
+        max_logvar = jnp.clip(
+            max_logvar,
+            LOGVAR_LOWER_BOUND + LOGVAR_BOUND_EPS,
+            LOGVAR_UPPER_BOUND,
+        )
+        min_logvar = jnp.clip(
+            min_logvar,
+            LOGVAR_LOWER_BOUND,
+            LOGVAR_UPPER_BOUND - LOGVAR_BOUND_EPS,
+        )
+        max_logvar = jnp.maximum(max_logvar, min_logvar + LOGVAR_BOUND_EPS)
 
         logvar = max_logvar - nn.softplus(max_logvar - raw_logvar)
         logvar = min_logvar + nn.softplus(logvar - min_logvar)
         return mean, logvar
+
 
 def load_arrays(data_path: str | Path) -> dict[str, np.ndarray]:
     data = np.load(data_path)
@@ -395,14 +423,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--data_path",
         type=str,
-        default="jax_implementation/MBRL/dyn_data/pets_pretrain_envB1024_T10000_pid_noisy_seed0.npz",
+        default=DEFAULT_DATA_PATH,
     )
     parser.add_argument("--train_ratio", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--ensemble_size", type=int, default=8)
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--steps_per_epoch", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1000)
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--eval_every", type=int, default=5)
     parser.add_argument("--val_batches", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -416,6 +444,7 @@ def _build_parser() -> argparse.ArgumentParser:
 ##Ensembling
 class EnsembleDynamics(nn.Module):
     ensemble_size: int = 8
+
     @nn.compact
     def __call__(self, x):
         VmappedModel = nn.vmap(
@@ -427,32 +456,42 @@ class EnsembleDynamics(nn.Module):
             axis_size=self.ensemble_size,
         )
         return VmappedModel()(x)
+
+
+def _logvar_reg(params) -> jnp.ndarray:
+    model_params = params["VmapDynamics_Model_0"]
+    max_logvar = model_params["max_logvar"]
+    min_logvar = model_params["min_logvar"]
+    return LOGVAR_REG_COEF * (jnp.sum(max_logvar) - jnp.sum(min_logvar))
+
+
 @jax.jit
 def train_step(state, batch_x, batch_y, y_std):
-
-
     def loss_fn(params):
-        mean, logvar =    state.apply_fn({"params": params}, batch_x)  # (E,B,97), (E,B,97)
-        
+        mean, logvar = state.apply_fn({"params": params}, batch_x)  # (E,B,97), (E,B,97)
         inv_var = jnp.exp(-logvar)
-        nll = jnp.sum((mean - batch_y) ** 2 *inv_var+logvar, axis=-1)
+        nll = jnp.sum((mean - batch_y) ** 2 * inv_var + logvar, axis=-1)
         loss_per_model = jnp.mean(nll, axis=-1)   # (E,)
         loss = jnp.mean(loss_per_model)           # scalar
+        logvar_reg = _logvar_reg(params)
+        objective = loss + logvar_reg
         mse_per_model = jnp.mean(jnp.square(mean - batch_y), axis=(1, 2))
         raw_error = (mean - batch_y) * y_std[None, None, :]
         raw_mse_per_model = jnp.mean(jnp.square(raw_error), axis=(1, 2))
         raw_delta_mse_per_model = jnp.mean(jnp.square(raw_error[..., :OBS_DIM]), axis=(1, 2))
         raw_reward_mse_per_model = jnp.mean(jnp.square(raw_error[..., OBS_DIM:]), axis=(1, 2))
         metrics = {
+            "objective": objective,
             "loss": loss,
+            "logvar_reg": logvar_reg,
             "loss_per_model": loss_per_model,
             "mse": jnp.mean(mse_per_model),
             "raw_mse": jnp.mean(raw_mse_per_model),
             "raw_delta_mse": jnp.mean(raw_delta_mse_per_model),
             "raw_reward_mse": jnp.mean(raw_reward_mse_per_model),
         }
-        return loss, metrics
-    
+        return objective, metrics
+
     (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
     return state, metrics
@@ -465,13 +504,16 @@ def eval_step(params, apply_fn, batch_x, batch_y, y_std):
     nll = jnp.sum((mean - batch_y) ** 2 * inv_var + logvar, axis=-1)
     loss_per_model = jnp.mean(nll, axis=-1)
     loss = jnp.mean(loss_per_model)
+    logvar_reg = _logvar_reg(params)
     mse_per_model = jnp.mean(jnp.square(mean - batch_y), axis=(1, 2))
     raw_error = (mean - batch_y) * y_std[None, None, :]
     raw_mse_per_model = jnp.mean(jnp.square(raw_error), axis=(1, 2))
     raw_delta_mse_per_model = jnp.mean(jnp.square(raw_error[..., :OBS_DIM]), axis=(1, 2))
     raw_reward_mse_per_model = jnp.mean(jnp.square(raw_error[..., OBS_DIM:]), axis=(1, 2))
     metrics = {
+        "objective": loss + logvar_reg,
         "loss": loss,
+        "logvar_reg": logvar_reg,
         "loss_per_model": loss_per_model,
         "mse": jnp.mean(mse_per_model),
         "raw_mse": jnp.mean(raw_mse_per_model),
@@ -487,6 +529,17 @@ def save_params(path: Path, params) -> None:
 
 def to_float_list(x) -> list[float]:
     return [float(v) for v in np.asarray(x, dtype=np.float32).tolist()]
+
+
+def assert_finite_metrics(metrics: dict[str, object], context: str) -> None:
+    bad = []
+    for key, value in metrics.items():
+        arr = np.asarray(value)
+        if not np.all(np.isfinite(arr)):
+            bad.append(f"{key}={arr}")
+    if bad:
+        raise FloatingPointError(f"Non-finite metrics at {context}: " + ", ".join(bad))
+
 
 if __name__ == "__main__":
     args = _build_parser().parse_args()
@@ -543,7 +596,10 @@ if __name__ == "__main__":
     state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=params,
-        tx=optax.adam(args.lr),
+        tx=optax.chain(
+            optax.clip_by_global_norm(GRAD_CLIP_NORM),
+            optax.adam(args.lr),
+        ),
     )
     np.save(save_dir / "train_idx.npy", train_idx)
     np.save(save_dir / "test_idx.npy", test_idx)
@@ -569,6 +625,7 @@ if __name__ == "__main__":
 
             state, metrics = train_step(state, batch_x, batch_y, y_std)
             metrics = jax.device_get(metrics)
+            assert_finite_metrics(metrics, f"train epoch={epoch} step={num_train_batches + 1}")
             train_loss_sum += float(metrics["loss"])
             train_loss_per_model_sum += np.asarray(metrics["loss_per_model"], dtype=np.float64)
             train_mse_sum += float(metrics["mse"])
@@ -610,6 +667,7 @@ if __name__ == "__main__":
 
                 val_metrics = eval_step(state.params, state.apply_fn, bx, by, y_std)
                 val_metrics = jax.device_get(val_metrics)
+                assert_finite_metrics(val_metrics, f"val epoch={epoch} batch={batch_id}")
                 val_loss_sum += float(val_metrics["loss"])
                 val_loss_per_model_sum += np.asarray(val_metrics["loss_per_model"], dtype=np.float64)
                 val_mse_sum += float(val_metrics["mse"])
