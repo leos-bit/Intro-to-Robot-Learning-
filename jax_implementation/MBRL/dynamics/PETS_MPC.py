@@ -2,6 +2,7 @@ import argparse
 import json
 import os
 import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,7 @@ from jax_implementation.env import _sync_viewer_data, default_config, newDrone
 from jax_implementation.MBRL.dynamics.PETS_Pretrain import (
     ACTION_DIM,
     GRAD_CLIP_NORM,
+    MAX_OBSTACLES,
     OBS_DIM,
     EnsembleDynamics,
     assert_finite_metrics,
@@ -40,11 +42,34 @@ from jax_implementation.MBRL.dynamics.PETS_Pretrain import (
 
 DEFAULT_DATA_PATH = (
     "jax_implementation/MBRL/dyn_data/"
-    "pets_pretrain_envB512_T10000_pid_noisy_seed0.npz"
+    "pets_pretrain_envB1024_T10000_pid_noisy_seed0.npz"
 )
 DEFAULT_CHECKPOINT_DIR = "jax_implementation/MBRL/checkpoints/pets_pretrain"
 DEFAULT_SAVE_DIR = "jax_implementation/MBRL/checkpoints/pets_online"
 DEFAULT_ONLINE_DATA_DIR = "jax_implementation/MBRL/dyn_data"
+AGENT_POS_XY_SLICE = slice(0, 2)
+AGENT_POS_Z_SLICE = slice(2, 3)
+AGENT_VEL_SLICE = slice(7, 10)
+TARGET_SLICE = slice(10, 13)
+LIDAR_SLICE = slice(17, 35)
+OBSTACLE_REL_SLICE = slice(35, 80)
+OBSTACLE_MASK_SLICE = slice(80, 95)
+HORIZONTAL_LIDAR_INDICES = np.asarray([0, 1, 2, 3, 6, 7, 8, 9], dtype=np.int32)
+
+
+@dataclass
+class ReplayFrame:
+    qpos: np.ndarray
+    qvel: np.ndarray
+    ctrl: np.ndarray
+    mocap_pos: np.ndarray | None
+    mocap_quat: np.ndarray | None
+
+
+@dataclass
+class EpisodeReplay:
+    episode_id: int
+    frames: list[ReplayFrame]
 
 
 def _parse_override(raw_value: str) -> Any:
@@ -113,6 +138,143 @@ def flatten_transition_block(
         "next_obs": next_obs,
         "reward": reward,
     }
+
+
+def build_rollout_reward_state(info: dict[str, jax.Array]) -> dict[str, jax.Array]:
+    return {
+        "prev_action": jnp.asarray(info["prev_action"], dtype=jnp.float32).reshape((ACTION_DIM,)),
+        "prev_distance": jnp.asarray(info["prev_distance"], dtype=jnp.float32),
+        "min_distance_to_goal": jnp.asarray(info["min_distance_to_goal"], dtype=jnp.float32),
+        "collision_streak": jnp.asarray(info["collision_streak"], dtype=jnp.int32),
+        "goal_hold_streak": jnp.asarray(info["goal_hold_streak"], dtype=jnp.int32),
+        "prev_obstacle_risk": jnp.asarray(info["prev_obstacle_risk"], dtype=jnp.float32),
+        "prev_goal_path_risk": jnp.asarray(info["prev_goal_path_risk"], dtype=jnp.float32),
+        "step": jnp.asarray(info["step"], dtype=jnp.int32),
+    }
+
+
+def build_reward_params(env: newDrone) -> dict[str, Any]:
+    return {
+        "horizontal_lidar_indices": np.asarray(
+            jax.device_get(env._horizontal_lidar_indices),
+            dtype=np.int32,
+        ),
+        "lidar_max_dist": float(env.lidar_max_dist),
+        "lidar_softmin_tau": float(env.lidar_softmin_tau),
+        "lidar_warn_dist": float(env.lidar_warn_dist),
+        "obstacle_safe_dist": float(env.obstacle_safe_dist),
+        "lidar_risk_weight": float(env.lidar_risk_weight),
+        "true_obstacle_risk_weight": float(env.true_obstacle_risk_weight),
+        "drone_clearance_radius": float(env.drone_clearance_radius),
+        "obstacle_radius": float(env.obstacle_radius),
+        "goal_path_clearance_margin": float(env.goal_path_clearance_margin),
+        "w_progress": float(env.w_progress),
+        "w_goal_path_clear": float(env.w_goal_path_clear),
+        "w_obs": float(env.w_obs),
+        "r_collision": float(env.r_collision),
+        "w_energy": float(env.w_energy),
+        "w_smooth": float(env.w_smooth),
+        "w_goal_best_progress": float(env.w_goal_best_progress),
+        "goal_proximity_scale": float(env.goal_proximity_scale),
+        "w_goal_regress": float(env.w_goal_regress),
+        "w_goal_proximity": float(env.w_goal_proximity),
+        "safety_xy_scale": float(env.safety_xy_scale),
+        "xylim": float(env.xylim),
+        "safety_z_low": float(env.safety_z_low),
+        "safety_z_high_scale": float(env.safety_z_high_scale),
+        "zlim": float(env.zlim),
+        "safety_speed_scale": float(env.safety_speed_scale),
+        "vellim": float(env.vellim),
+        "w_speed": float(env.w_speed),
+        "eps_goal": float(env.eps_goal),
+        "hover_speed_epsilon": float(env.hover_speed_epsilon),
+        "w_goal_hover": float(env.w_goal_hover),
+        "hover_success_steps": int(env.hover_success_steps),
+        "r_goal": float(env.r_goal),
+        "terminate_on_collision": bool(env.terminate_on_collision),
+        "collision_terminate_steps": int(env.collision_terminate_steps),
+        "max_steps": int(env.max_steps),
+        "termination_penalty": float(env.termination_penalty),
+        "terminal_distance_penalty": float(env.terminal_distance_penalty),
+    }
+
+
+def _softmin(x: jax.Array, temperature: jax.Array) -> jax.Array:
+    x = jnp.asarray(x, dtype=jnp.float32)
+    tau = jnp.maximum(jnp.asarray(temperature, dtype=jnp.float32), 1e-3)
+    return -tau * jax.nn.logsumexp(-x / tau, axis=-1)
+
+
+def _split_rollout_obs(obs: jax.Array) -> dict[str, jax.Array]:
+    agent_location = jnp.concatenate(
+        [obs[..., AGENT_POS_XY_SLICE], obs[..., AGENT_POS_Z_SLICE]],
+        axis=-1,
+    )
+    return {
+        "agent_location": agent_location,
+        "agent_vel": obs[..., AGENT_VEL_SLICE],
+        "target": obs[..., TARGET_SLICE],
+        "lidar": obs[..., LIDAR_SLICE],
+        "obstacle_rel": obs[..., OBSTACLE_REL_SLICE].reshape(*obs.shape[:-1], MAX_OBSTACLES, 3),
+        "obstacle_mask": obs[..., OBSTACLE_MASK_SLICE],
+    }
+
+
+def _rollout_obstacle_terms(
+    lidar: jax.Array,
+    obstacle_rel: jax.Array,
+    obstacle_mask: jax.Array,
+    reward_params: dict[str, jax.Array],
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    horizontal_lidar = jnp.asarray(lidar, dtype=jnp.float32)[..., reward_params["horizontal_lidar_indices"]]
+    lidar_clearance = _softmin(horizontal_lidar, reward_params["lidar_softmin_tau"])
+    obstacle_mask_bool = jnp.asarray(obstacle_mask > 0.0)
+    obstacle_xy_dist = jnp.sqrt(jnp.sum(jnp.square(obstacle_rel[..., :2]), axis=-1) + 1e-8)
+    true_clearance_all = obstacle_xy_dist - (
+        reward_params["drone_clearance_radius"] + reward_params["obstacle_radius"]
+    )
+    true_clearance_all = jnp.where(
+        obstacle_mask_bool,
+        true_clearance_all,
+        jnp.full_like(true_clearance_all, jnp.inf),
+    )
+    true_clearance = jnp.where(
+        jnp.any(obstacle_mask_bool, axis=-1),
+        jnp.min(true_clearance_all, axis=-1),
+        reward_params["lidar_max_dist"],
+    )
+    lidar_risk = reward_params["lidar_risk_weight"] * jnp.square(
+        jnp.maximum(0.0, reward_params["lidar_warn_dist"] - lidar_clearance)
+    )
+    true_risk = reward_params["true_obstacle_risk_weight"] * jnp.square(
+        jnp.maximum(0.0, reward_params["obstacle_safe_dist"] - true_clearance)
+    )
+    obstacle_risk = lidar_risk + true_risk
+    return lidar_clearance, true_clearance, obstacle_risk
+
+
+def _rollout_goal_path_risk(
+    agent_location: jax.Array,
+    target: jax.Array,
+    obstacle_rel: jax.Array,
+    obstacle_mask: jax.Array,
+    reward_params: dict[str, jax.Array],
+) -> jax.Array:
+    goal_vec_xy = target[..., :2] - agent_location[..., :2]
+    goal_dist_xy = jnp.sqrt(jnp.sum(jnp.square(goal_vec_xy), axis=-1) + 1e-8)
+    goal_dir_xy = goal_vec_xy / jnp.maximum(goal_dist_xy[..., None], 1e-6)
+    rel_xy = obstacle_rel[..., :2]
+    along = jnp.sum(rel_xy * goal_dir_xy[..., None, :], axis=-1)
+    lateral_vec = rel_xy - (along[..., None] * goal_dir_xy[..., None, :])
+    lateral = jnp.sqrt(jnp.sum(jnp.square(lateral_vec), axis=-1) + 1e-8)
+    corridor_radius = (
+        reward_params["drone_clearance_radius"]
+        + reward_params["obstacle_radius"]
+        + reward_params["goal_path_clearance_margin"]
+    )
+    between = (obstacle_mask > 0.0) & (along > 0.0) & (along < goal_dist_xy[..., None])
+    shortfall = jnp.where(between, jnp.maximum(0.0, corridor_radius - lateral), 0.0)
+    return jnp.max(shortfall, axis=-1)
 
 
 class OnlineReplayBuffer:
@@ -210,12 +372,48 @@ class OnlineReplayBuffer:
             out["reward"][~base_mask] = online["reward"][online_idx]
         return out
 
+    def sample_mixed_transitions(
+        self,
+        rng: np.random.Generator,
+        batch_size: int,
+        online_fraction: float,
+    ) -> dict[str, np.ndarray]:
+        if batch_size <= 0:
+            raise ValueError("batch_size must be positive.")
+        if not 0.0 <= online_fraction <= 1.0:
+            raise ValueError("online_fraction must be in [0, 1].")
+
+        use_online = self.online_size > 0 and online_fraction > 0.0
+        if not use_online:
+            idx = rng.integers(0, self.base_size, size=batch_size, dtype=np.int64)
+            return self.sample_transitions(idx)
+
+        n_online = int(round(batch_size * online_fraction))
+        n_online = min(max(n_online, 1), batch_size)
+        n_base = batch_size - n_online
+
+        base_idx = (
+            rng.integers(0, self.base_size, size=n_base, dtype=np.int64)
+            if n_base > 0
+            else np.zeros((0,), dtype=np.int64)
+        )
+        online_idx = self.base_size + rng.integers(
+            0,
+            self.online_size,
+            size=n_online,
+            dtype=np.int64,
+        )
+        idx = np.concatenate([base_idx, online_idx], axis=0)
+        rng.shuffle(idx)
+        return self.sample_transitions(idx)
+
     def save_online_only(self, path: Path, metadata: dict[str, Any]) -> Path:
         online = self._build_online_cache()
         np.savez(
             path,
             obs=online["obs"],
             action=online["action"],
+            applied_action=online["action"],
             next_obs=online["next_obs"],
             reward=online["reward"],
             metadata_json=np.asarray(json.dumps(metadata), dtype=np.str_),
@@ -228,15 +426,19 @@ class PETSEnsembleTrainer:
         self,
         ensemble_size: int,
         lr: float,
+        online_fraction: float,
         seed: int,
         norm_stats: dict[str, np.ndarray],
         init_params_path: Path | None,
     ) -> None:
         self.ensemble_size = int(ensemble_size)
+        self.online_fraction = float(online_fraction)
         self.norm_stats = {
             key: np.asarray(value, dtype=np.float32)
             for key, value in norm_stats.items()
         }
+        if not 0.0 <= self.online_fraction <= 1.0:
+            raise ValueError("online_fraction must be in [0, 1].")
         self.x_mean = self.norm_stats["x_mean"]
         self.x_std = self.norm_stats["x_std"]
         self.y_mean = self.norm_stats["y_mean"]
@@ -290,15 +492,13 @@ class PETSEnsembleTrainer:
         }
 
         for step_id in range(num_updates):
-            indices = self.rng.integers(
-                0,
-                replay.total_size,
-                size=(self.ensemble_size, batch_size),
-                dtype=np.int64,
-            )
             member_batches = []
-            for member_id in range(self.ensemble_size):
-                transitions = replay.sample_transitions(indices[member_id])
+            for _ in range(self.ensemble_size):
+                transitions = replay.sample_mixed_transitions(
+                    rng=self.rng,
+                    batch_size=batch_size,
+                    online_fraction=self.online_fraction,
+                )
                 member_batches.append(self._build_xy(transitions))
             batch_x = jnp.asarray(
                 np.stack([bx for bx, _ in member_batches], axis=0),
@@ -369,6 +569,143 @@ class PETSEnsembleTrainer:
         return {key: value / denom for key, value in stats.items()}
 
 
+def _analytic_rollout_reward(
+    next_obs: jax.Array,
+    action: jax.Array,
+    prev_action: jax.Array,
+    prev_distance: jax.Array,
+    min_distance_to_goal: jax.Array,
+    collision_streak: jax.Array,
+    goal_hold_streak: jax.Array,
+    prev_obstacle_risk: jax.Array,
+    prev_goal_path_risk: jax.Array,
+    step: jax.Array,
+    reward_params: dict[str, jax.Array],
+) -> tuple[jax.Array, dict[str, jax.Array]]:
+    obs_parts = _split_rollout_obs(next_obs)
+    dist = jnp.sqrt(
+        jnp.sum(jnp.square(obs_parts["target"] - obs_parts["agent_location"]), axis=-1) + 1e-8
+    )
+    delta_action = action - prev_action
+    _, true_clearance, obstacle_risk = _rollout_obstacle_terms(
+        obs_parts["lidar"],
+        obs_parts["obstacle_rel"],
+        obs_parts["obstacle_mask"],
+        reward_params,
+    )
+    goal_path_risk = _rollout_goal_path_risk(
+        obs_parts["agent_location"],
+        obs_parts["target"],
+        obs_parts["obstacle_rel"],
+        obs_parts["obstacle_mask"],
+        reward_params,
+    )
+
+    collision_contact = true_clearance <= 0.0
+    next_collision_streak = jnp.where(
+        collision_contact,
+        collision_streak + jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    collision = next_collision_streak >= reward_params["collision_terminate_steps"]
+
+    r_prog = reward_params["w_progress"] * (prev_distance - dist)
+    r_obs = reward_params["w_obs"] * (prev_obstacle_risk - obstacle_risk)
+    r_goal_path = reward_params["w_goal_path_clear"] * (prev_goal_path_risk - goal_path_risk)
+    r_coll = jnp.where(collision, -reward_params["r_collision"], 0.0)
+    r_energy = -reward_params["w_energy"] * jnp.sum(jnp.square(action), axis=-1)
+    r_smooth = -reward_params["w_smooth"] * jnp.sum(jnp.square(delta_action), axis=-1)
+
+    next_min_distance = jnp.minimum(min_distance_to_goal, dist)
+    r_goal_best = reward_params["w_goal_best_progress"] * (
+        min_distance_to_goal - next_min_distance
+    )
+    min_goal_near_frac = jnp.clip(
+        1.0 - (min_distance_to_goal / reward_params["goal_proximity_scale"]),
+        0.0,
+        1.0,
+    )
+    goal_regress = jnp.maximum(0.0, dist - min_distance_to_goal)
+    r_goal_regress = -reward_params["w_goal_regress"] * min_goal_near_frac * goal_regress
+    prev_goal_near_frac = jnp.clip(
+        1.0 - (prev_distance / reward_params["goal_proximity_scale"]),
+        0.0,
+        1.0,
+    )
+    goal_near_frac = jnp.clip(
+        1.0 - (dist / reward_params["goal_proximity_scale"]),
+        0.0,
+        1.0,
+    )
+    r_goal_prox = reward_params["w_goal_proximity"] * (
+        jnp.square(goal_near_frac) - jnp.square(prev_goal_near_frac)
+    )
+
+    pos = obs_parts["agent_location"]
+    out_of_bounds = (
+        (jnp.abs(pos[..., 0]) > (reward_params["safety_xy_scale"] * reward_params["xylim"]))
+        | (jnp.abs(pos[..., 1]) > (reward_params["safety_xy_scale"] * reward_params["xylim"]))
+        | (pos[..., 2] < reward_params["safety_z_low"])
+        | (pos[..., 2] > (reward_params["safety_z_high_scale"] * reward_params["zlim"]))
+    )
+    speed_sq = jnp.sum(jnp.square(obs_parts["agent_vel"]), axis=-1)
+    excessive_speed = speed_sq > jnp.square(
+        reward_params["safety_speed_scale"] * reward_params["vellim"]
+    )
+    safety_terminated = out_of_bounds | excessive_speed
+    r_safety = jnp.where(safety_terminated, -reward_params["r_collision"], 0.0)
+    r_speed = -reward_params["w_speed"] * speed_sq
+
+    hovering_at_goal = (dist <= reward_params["eps_goal"]) & (
+        speed_sq <= jnp.square(reward_params["hover_speed_epsilon"])
+    )
+    next_goal_hold_streak = jnp.where(
+        hovering_at_goal,
+        goal_hold_streak + jnp.asarray(1, dtype=jnp.int32),
+        jnp.asarray(0, dtype=jnp.int32),
+    )
+    success = next_goal_hold_streak >= reward_params["hover_success_steps"]
+
+    reward = (
+        r_prog
+        + r_obs
+        + r_goal_path
+        + r_coll
+        + r_energy
+        + r_smooth
+        + r_safety
+        + r_speed
+        + r_goal_prox
+        + r_goal_best
+        + r_goal_regress
+        + (reward_params["w_goal_hover"] * jnp.where(hovering_at_goal, 1.0, 0.0))
+        + jnp.where(success, reward_params["r_goal"], 0.0)
+    )
+
+    next_step = step + jnp.asarray(1, dtype=jnp.int32)
+    terminated = success | (reward_params["terminate_on_collision"] & collision) | safety_terminated
+    truncated = next_step >= reward_params["max_steps"]
+    failure_episode_end = (terminated | truncated) & (~success)
+    reward = reward + jnp.where(
+        failure_episode_end,
+        -(reward_params["termination_penalty"] + reward_params["terminal_distance_penalty"] * dist),
+        0.0,
+    )
+
+    next_rollout_state = {
+        "prev_action": action,
+        "prev_distance": dist,
+        "min_distance_to_goal": next_min_distance,
+        "collision_streak": next_collision_streak,
+        "goal_hold_streak": next_goal_hold_streak,
+        "prev_obstacle_risk": obstacle_risk,
+        "prev_goal_path_risk": goal_path_risk,
+        "step": next_step,
+        "done": terminated | truncated,
+    }
+    return reward, next_rollout_state
+
+
 def build_rollout_eval_fn(
     apply_fn,
     ensemble_size: int,
@@ -379,6 +716,7 @@ def build_rollout_eval_fn(
     y_std: np.ndarray,
     obs_low: np.ndarray,
     obs_high: np.ndarray,
+    reward_params: dict[str, Any],
     num_particles: int,
     gamma: float,
     deterministic_rollouts: bool,
@@ -391,9 +729,97 @@ def build_rollout_eval_fn(
     obs_high_j = jnp.asarray(obs_high, dtype=jnp.float32)
     action_scale_j = jnp.asarray(float(action_scale), dtype=jnp.float32)
     gamma_j = jnp.asarray(float(gamma), dtype=jnp.float32)
+    reward_params_j = {
+        "horizontal_lidar_indices": jnp.asarray(
+            reward_params["horizontal_lidar_indices"],
+            dtype=jnp.int32,
+        ),
+        "lidar_max_dist": jnp.asarray(reward_params["lidar_max_dist"], dtype=jnp.float32),
+        "lidar_softmin_tau": jnp.asarray(reward_params["lidar_softmin_tau"], dtype=jnp.float32),
+        "lidar_warn_dist": jnp.asarray(reward_params["lidar_warn_dist"], dtype=jnp.float32),
+        "obstacle_safe_dist": jnp.asarray(reward_params["obstacle_safe_dist"], dtype=jnp.float32),
+        "lidar_risk_weight": jnp.asarray(reward_params["lidar_risk_weight"], dtype=jnp.float32),
+        "true_obstacle_risk_weight": jnp.asarray(
+            reward_params["true_obstacle_risk_weight"],
+            dtype=jnp.float32,
+        ),
+        "drone_clearance_radius": jnp.asarray(
+            reward_params["drone_clearance_radius"],
+            dtype=jnp.float32,
+        ),
+        "obstacle_radius": jnp.asarray(reward_params["obstacle_radius"], dtype=jnp.float32),
+        "goal_path_clearance_margin": jnp.asarray(
+            reward_params["goal_path_clearance_margin"],
+            dtype=jnp.float32,
+        ),
+        "w_progress": jnp.asarray(reward_params["w_progress"], dtype=jnp.float32),
+        "w_goal_path_clear": jnp.asarray(reward_params["w_goal_path_clear"], dtype=jnp.float32),
+        "w_obs": jnp.asarray(reward_params["w_obs"], dtype=jnp.float32),
+        "r_collision": jnp.asarray(reward_params["r_collision"], dtype=jnp.float32),
+        "w_energy": jnp.asarray(reward_params["w_energy"], dtype=jnp.float32),
+        "w_smooth": jnp.asarray(reward_params["w_smooth"], dtype=jnp.float32),
+        "w_goal_best_progress": jnp.asarray(
+            reward_params["w_goal_best_progress"],
+            dtype=jnp.float32,
+        ),
+        "goal_proximity_scale": jnp.asarray(
+            reward_params["goal_proximity_scale"],
+            dtype=jnp.float32,
+        ),
+        "w_goal_regress": jnp.asarray(reward_params["w_goal_regress"], dtype=jnp.float32),
+        "w_goal_proximity": jnp.asarray(reward_params["w_goal_proximity"], dtype=jnp.float32),
+        "safety_xy_scale": jnp.asarray(reward_params["safety_xy_scale"], dtype=jnp.float32),
+        "xylim": jnp.asarray(reward_params["xylim"], dtype=jnp.float32),
+        "safety_z_low": jnp.asarray(reward_params["safety_z_low"], dtype=jnp.float32),
+        "safety_z_high_scale": jnp.asarray(
+            reward_params["safety_z_high_scale"],
+            dtype=jnp.float32,
+        ),
+        "zlim": jnp.asarray(reward_params["zlim"], dtype=jnp.float32),
+        "safety_speed_scale": jnp.asarray(
+            reward_params["safety_speed_scale"],
+            dtype=jnp.float32,
+        ),
+        "vellim": jnp.asarray(reward_params["vellim"], dtype=jnp.float32),
+        "w_speed": jnp.asarray(reward_params["w_speed"], dtype=jnp.float32),
+        "eps_goal": jnp.asarray(reward_params["eps_goal"], dtype=jnp.float32),
+        "hover_speed_epsilon": jnp.asarray(
+            reward_params["hover_speed_epsilon"],
+            dtype=jnp.float32,
+        ),
+        "w_goal_hover": jnp.asarray(reward_params["w_goal_hover"], dtype=jnp.float32),
+        "hover_success_steps": jnp.asarray(
+            reward_params["hover_success_steps"],
+            dtype=jnp.int32,
+        ),
+        "r_goal": jnp.asarray(reward_params["r_goal"], dtype=jnp.float32),
+        "terminate_on_collision": jnp.asarray(
+            reward_params["terminate_on_collision"],
+            dtype=jnp.bool_,
+        ),
+        "collision_terminate_steps": jnp.asarray(
+            reward_params["collision_terminate_steps"],
+            dtype=jnp.int32,
+        ),
+        "max_steps": jnp.asarray(reward_params["max_steps"], dtype=jnp.int32),
+        "termination_penalty": jnp.asarray(
+            reward_params["termination_penalty"],
+            dtype=jnp.float32,
+        ),
+        "terminal_distance_penalty": jnp.asarray(
+            reward_params["terminal_distance_penalty"],
+            dtype=jnp.float32,
+        ),
+    }
 
     @jax.jit
-    def _evaluate(params, obs0: jax.Array, action_sequences: jax.Array, rng: jax.Array) -> jax.Array:
+    def _evaluate(
+        params,
+        obs0: jax.Array,
+        rollout_state0: dict[str, jax.Array],
+        action_sequences: jax.Array,
+        rng: jax.Array,
+    ) -> jax.Array:
         population = action_sequences.shape[0]
         horizon = action_sequences.shape[1]
         model_key, noise_master_key = jax.random.split(rng)
@@ -401,6 +827,39 @@ def build_rollout_eval_fn(
             obs0[None, None, :],
             (population, num_particles, OBS_DIM),
         )
+        prev_action = jnp.broadcast_to(
+            rollout_state0["prev_action"][None, None, :],
+            (population, num_particles, ACTION_DIM),
+        )
+        prev_distance = jnp.broadcast_to(
+            rollout_state0["prev_distance"][None, None],
+            (population, num_particles),
+        )
+        min_distance_to_goal = jnp.broadcast_to(
+            rollout_state0["min_distance_to_goal"][None, None],
+            (population, num_particles),
+        )
+        collision_streak = jnp.broadcast_to(
+            rollout_state0["collision_streak"][None, None],
+            (population, num_particles),
+        )
+        goal_hold_streak = jnp.broadcast_to(
+            rollout_state0["goal_hold_streak"][None, None],
+            (population, num_particles),
+        )
+        prev_obstacle_risk = jnp.broadcast_to(
+            rollout_state0["prev_obstacle_risk"][None, None],
+            (population, num_particles),
+        )
+        prev_goal_path_risk = jnp.broadcast_to(
+            rollout_state0["prev_goal_path_risk"][None, None],
+            (population, num_particles),
+        )
+        step_count = jnp.broadcast_to(
+            rollout_state0["step"][None, None],
+            (population, num_particles),
+        )
+        active = jnp.ones((population, num_particles), dtype=jnp.bool_)
         model_ids = jax.random.randint(
             model_key,
             shape=(population, num_particles),
@@ -413,7 +872,19 @@ def build_rollout_eval_fn(
         total_returns = jnp.zeros((population, num_particles), dtype=jnp.float32)
 
         def _step(carry, inputs):
-            current_obs, returns = carry
+            (
+                current_obs,
+                prev_action_c,
+                prev_distance_c,
+                min_distance_c,
+                collision_streak_c,
+                goal_hold_streak_c,
+                prev_obstacle_risk_c,
+                prev_goal_path_risk_c,
+                step_count_c,
+                active_c,
+                returns,
+            ) = carry
             action_t, noise_key_t, discount_t = inputs
             raw_action = jnp.broadcast_to(
                 action_t[:, None, :],
@@ -445,15 +916,74 @@ def build_rollout_eval_fn(
                 chosen_target_norm = chosen_mean_norm + (noise * chosen_std_norm)
             chosen_target = (chosen_target_norm * y_std_j) + y_mean_j
             delta = chosen_target[:, :OBS_DIM]
-            reward = chosen_target[:, OBS_DIM]
-            next_obs = jnp.clip(obs_flat + delta, obs_low_j, obs_high_j)
-            next_obs = next_obs.reshape(population, num_particles, OBS_DIM)
-            returns = returns + (discount_t * reward.reshape(population, num_particles))
-            return (next_obs, returns), None
+            next_obs_flat = jnp.clip(
+                jnp.nan_to_num(obs_flat + delta, nan=0.0, posinf=0.0, neginf=0.0),
+                obs_low_j,
+                obs_high_j,
+            )
+            reward_flat, next_rollout_state = _analytic_rollout_reward(
+                next_obs=next_obs_flat,
+                action=act_flat,
+                prev_action=prev_action_c.reshape(-1, ACTION_DIM),
+                prev_distance=prev_distance_c.reshape(-1),
+                min_distance_to_goal=min_distance_c.reshape(-1),
+                collision_streak=collision_streak_c.reshape(-1),
+                goal_hold_streak=goal_hold_streak_c.reshape(-1),
+                prev_obstacle_risk=prev_obstacle_risk_c.reshape(-1),
+                prev_goal_path_risk=prev_goal_path_risk_c.reshape(-1),
+                step=step_count_c.reshape(-1),
+                reward_params=reward_params_j,
+            )
 
-        (_, total_returns), _ = jax.lax.scan(
+            active_flat = active_c.reshape(-1)
+            reward_flat = jnp.where(active_flat, reward_flat, 0.0)
+            next_done_flat = jnp.where(active_flat, next_rollout_state["done"], True)
+            next_active = (~next_done_flat).reshape(population, num_particles)
+            returns = returns + (
+                discount_t * reward_flat.reshape(population, num_particles)
+            )
+            next_obs = next_obs_flat.reshape(population, num_particles, OBS_DIM)
+            return (
+                next_obs,
+                next_rollout_state["prev_action"].reshape(population, num_particles, ACTION_DIM),
+                next_rollout_state["prev_distance"].reshape(population, num_particles),
+                next_rollout_state["min_distance_to_goal"].reshape(population, num_particles),
+                next_rollout_state["collision_streak"].reshape(population, num_particles),
+                next_rollout_state["goal_hold_streak"].reshape(population, num_particles),
+                next_rollout_state["prev_obstacle_risk"].reshape(population, num_particles),
+                next_rollout_state["prev_goal_path_risk"].reshape(population, num_particles),
+                next_rollout_state["step"].reshape(population, num_particles),
+                next_active,
+                returns,
+            ), None
+
+        (
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            _,
+            total_returns,
+        ), _ = jax.lax.scan(
             _step,
-            (obs_particles, total_returns),
+            (
+                obs_particles,
+                prev_action,
+                prev_distance,
+                min_distance_to_goal,
+                collision_streak,
+                goal_hold_streak,
+                prev_obstacle_risk,
+                prev_goal_path_risk,
+                step_count,
+                active,
+                total_returns,
+            ),
             (
                 action_sequences.swapaxes(0, 1),
                 noise_keys,
@@ -471,6 +1001,7 @@ class PETSCEMPlanner:
         params,
         apply_fn,
         norm_stats: dict[str, np.ndarray],
+        reward_params: dict[str, Any],
         obs_low: np.ndarray,
         obs_high: np.ndarray,
         action_low: np.ndarray,
@@ -511,6 +1042,7 @@ class PETSCEMPlanner:
             y_std=norm_stats["y_std"],
             obs_low=obs_low,
             obs_high=obs_high,
+            reward_params=reward_params,
             num_particles=self.num_particles,
             gamma=gamma,
             deterministic_rollouts=deterministic_rollouts,
@@ -523,7 +1055,12 @@ class PETSCEMPlanner:
     def set_params(self, params) -> None:
         self.params = params
 
-    def plan(self, obs: jax.Array, rng: jax.Array) -> tuple[jax.Array, dict[str, float], jax.Array]:
+    def plan(
+        self,
+        obs: jax.Array,
+        rollout_state: dict[str, jax.Array],
+        rng: jax.Array,
+    ) -> tuple[jax.Array, dict[str, float], jax.Array]:
         mean = self.mean
         std = self.std
         best_score = -np.inf
@@ -541,7 +1078,13 @@ class PETSCEMPlanner:
                 self.action_low[None, None, :],
                 self.action_high[None, None, :],
             )
-            scores = self.evaluate_sequences(self.params, obs, action_sequences, eval_key)
+            scores = self.evaluate_sequences(
+                self.params,
+                obs,
+                rollout_state,
+                action_sequences,
+                eval_key,
+            )
             action_sequences_np = np.asarray(jax.device_get(action_sequences), dtype=np.float32)
             scores_np = np.asarray(jax.device_get(scores), dtype=np.float32)
             elite_idx = np.argpartition(scores_np, -self.elite_size)[-self.elite_size :]
@@ -579,34 +1122,75 @@ class PETSVisualizer:
     def __init__(
         self,
         env: newDrone,
-        render: bool,
+        render_live: bool,
+        render_completed_run: bool,
         real_time: bool,
         print_every: int,
     ) -> None:
         self.env = env
-        self.render = bool(render)
+        self.render_live = bool(render_live)
+        self.render_completed_run = bool(render_completed_run)
         self.real_time = bool(real_time)
         self.print_every = int(print_every)
         self.viewer = None
         self.viewer_data = None
         self.ctrl_dt = float(getattr(env, "_ctrl_dt", 0.0))
+        self.current_episode: EpisodeReplay | None = None
+        self.completed_episodes: list[EpisodeReplay] = []
 
-    def reset_episode(self, state) -> bool:
-        if not self.render:
-            return True
+    def _capture_frame(self, state) -> ReplayFrame:
+        data = state.data
+        mocap_pos = None
+        mocap_quat = None
+        if self.env.mj_model.nmocap > 0:
+            mocap_pos = np.asarray(jax.device_get(data.mocap_pos), dtype=np.float32).copy()
+            mocap_quat = np.asarray(jax.device_get(data.mocap_quat), dtype=np.float32).copy()
+        return ReplayFrame(
+            qpos=np.asarray(jax.device_get(data.qpos), dtype=np.float32).copy(),
+            qvel=np.asarray(jax.device_get(data.qvel), dtype=np.float32).copy(),
+            ctrl=np.asarray(jax.device_get(data.ctrl), dtype=np.float32).copy(),
+            mocap_pos=mocap_pos,
+            mocap_quat=mocap_quat,
+        )
+
+    def _ensure_viewer(self) -> None:
         if self.viewer_data is None:
             self.viewer_data = mujoco.MjData(self.env.mj_model)
-        _sync_viewer_data(self.env, self.viewer_data, state)
         if self.viewer is None:
             self.viewer = mujoco.viewer.launch_passive(self.env.mj_model, self.viewer_data)
             if self.env._track_camera_id >= 0:
                 self.viewer.cam.type = mujoco.mjtCamera.mjCAMERA_FIXED
                 self.viewer.cam.fixedcamid = self.env._track_camera_id
+
+    def _load_frame(self, frame: ReplayFrame) -> None:
+        self._ensure_viewer()
+        self.viewer_data.qpos[:] = frame.qpos
+        self.viewer_data.qvel[:] = frame.qvel
+        self.viewer_data.ctrl[:] = frame.ctrl
+        if self.env.mj_model.nmocap > 0 and frame.mocap_pos is not None and frame.mocap_quat is not None:
+            self.viewer_data.mocap_pos[:] = frame.mocap_pos
+            self.viewer_data.mocap_quat[:] = frame.mocap_quat
+        mujoco.mj_forward(self.env.mj_model, self.viewer_data)
+
+    def reset_episode(self, episode_id: int, state) -> bool:
+        if self.render_completed_run:
+            self.current_episode = EpisodeReplay(
+                episode_id=int(episode_id),
+                frames=[self._capture_frame(state)],
+            )
+        else:
+            self.current_episode = None
+        if not self.render_live:
+            return True
+        self._ensure_viewer()
+        _sync_viewer_data(self.env, self.viewer_data, state)
         self.viewer.sync()
         return self.is_running()
 
     def sync(self, state) -> bool:
-        if not self.render or self.viewer is None or self.viewer_data is None:
+        if self.current_episode is not None:
+            self.current_episode.frames.append(self._capture_frame(state))
+        if not self.render_live or self.viewer is None or self.viewer_data is None:
             return True
         _sync_viewer_data(self.env, self.viewer_data, state)
         self.viewer.sync()
@@ -646,16 +1230,47 @@ class PETSVisualizer:
             f"act={np.round(action_np, 3)} pos={np.round(pos, 3)} vel={np.round(vel, 3)}"
         )
 
-    def maybe_sleep(self, step_start_time: float) -> None:
+    def maybe_sleep(self, step_start_time: float, *, during_rollout: bool) -> None:
         if not self.real_time or self.ctrl_dt <= 0.0:
+            return
+        if during_rollout and not self.render_live:
             return
         elapsed = time.perf_counter() - step_start_time
         time.sleep(max(self.ctrl_dt - elapsed, 0.0))
+
+    def finish_episode(self) -> None:
+        if self.current_episode is None:
+            return
+        self.completed_episodes.append(self.current_episode)
+        self.current_episode = None
+
+    def replay_completed_episodes(self) -> None:
+        if not self.render_completed_run or not self.completed_episodes:
+            return
+        print(
+            f"[replay] Rendering {len(self.completed_episodes)} completed episode(s) after rollout."
+        )
+        for replay_idx, episode in enumerate(self.completed_episodes, start=1):
+            if not episode.frames:
+                continue
+            print(
+                f"[replay {replay_idx}/{len(self.completed_episodes)}] "
+                f"episode={episode.episode_id} frames={len(episode.frames)}"
+            )
+            for frame in episode.frames:
+                if not self.is_running():
+                    print("Viewer closed during replay.")
+                    return
+                frame_start_time = time.perf_counter()
+                self._load_frame(frame)
+                self.viewer.sync()
+                self.maybe_sleep(frame_start_time, during_rollout=False)
 
     def close(self) -> None:
         if self.viewer is not None:
             self.viewer.close()
             self.viewer = None
+        self.viewer_data = None
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -670,6 +1285,12 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--ensemble_size", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--batch_size", type=int, default=2048)
+    parser.add_argument(
+        "--online_batch_fraction",
+        type=float,
+        default=0.5,
+        help="Fraction of each online update batch drawn from post-rollout data.",
+    )
     parser.add_argument("--retrain_updates", type=int, default=250)
     parser.add_argument("--retrain_every", type=int, default=250)
     parser.add_argument("--warmup_online_steps", type=int, default=250)
@@ -692,9 +1313,14 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--jit_step", action="store_true")
     parser.add_argument("--render", action="store_true", help="Open a live MuJoCo viewer.")
     parser.add_argument(
+        "--render_completed_run",
+        action="store_true",
+        help="Record completed episodes and replay them after the run finishes.",
+    )
+    parser.add_argument(
         "--real_time",
         action="store_true",
-        help="Sleep to roughly match ctrl_dt while stepping.",
+        help="Sleep to roughly match ctrl_dt while rendering.",
     )
     parser.add_argument(
         "--print_every",
@@ -727,6 +1353,10 @@ def main() -> None:
         raise ValueError("--retrain_every must be positive.")
     if args.batch_size <= 0 or args.retrain_updates <= 0:
         raise ValueError("--batch_size and --retrain_updates must be positive.")
+    if not 0.0 <= args.online_batch_fraction <= 1.0:
+        raise ValueError("--online_batch_fraction must be in [0, 1].")
+    if args.render and args.render_completed_run:
+        raise ValueError("Use either --render or --render_completed_run, not both.")
 
     checkpoint_dir = Path(args.checkpoint_dir)
     save_dir = Path(args.save_dir)
@@ -741,7 +1371,8 @@ def main() -> None:
     obs_low, obs_high = build_flat_obs_bounds(env, obs_keys)
     visualizer = PETSVisualizer(
         env=env,
-        render=args.render,
+        render_live=args.render,
+        render_completed_run=args.render_completed_run,
         real_time=args.real_time,
         print_every=args.print_every,
     )
@@ -784,6 +1415,7 @@ def main() -> None:
     trainer = PETSEnsembleTrainer(
         ensemble_size=args.ensemble_size,
         lr=args.lr,
+        online_fraction=args.online_batch_fraction,
         seed=args.seed,
         norm_stats=norm_stats,
         init_params_path=init_params_path,
@@ -792,6 +1424,7 @@ def main() -> None:
         params=trainer.state.params,
         apply_fn=trainer.state.apply_fn,
         norm_stats=norm_stats,
+        reward_params=build_reward_params(env),
         obs_low=obs_low,
         obs_high=obs_high,
         action_low=np.asarray(env.action_low, dtype=np.float32),
@@ -825,7 +1458,12 @@ def main() -> None:
             rng, warm_reset_rng, warm_plan_rng = jax.random.split(rng, 3)
             warm_state = env.reset(warm_reset_rng)
             warm_obs = flatten_obs(warm_state.obs, obs_keys)
-            warm_action, _, warm_plan_rng = planner.plan(warm_obs, warm_plan_rng)
+            warm_rollout_state = build_rollout_reward_state(warm_state.info)
+            warm_action, _, warm_plan_rng = planner.plan(
+                warm_obs,
+                warm_rollout_state,
+                warm_plan_rng,
+            )
             compile_start = time.perf_counter()
             warm_state = step_fn(warm_state, warm_action)
             jax.block_until_ready(warm_state.reward)
@@ -835,7 +1473,7 @@ def main() -> None:
             planner.reset()
             rng, reset_rng, plan_rng = jax.random.split(rng, 3)
             state = env.reset(reset_rng)
-            if not visualizer.reset_episode(state):
+            if not visualizer.reset_episode(episode_id + 1, state):
                 print("Viewer closed, stopping PETS run.")
                 stop_requested = True
                 break
@@ -847,7 +1485,12 @@ def main() -> None:
             for step_id in range(args.max_steps):
                 step_start_time = time.perf_counter()
                 obs_flat = flatten_obs(state.obs, obs_keys)
-                action, plan_info, plan_rng = planner.plan(obs_flat, plan_rng)
+                rollout_state = build_rollout_reward_state(state.info)
+                action, plan_info, plan_rng = planner.plan(
+                    obs_flat,
+                    rollout_state,
+                    plan_rng,
+                )
                 last_plan_info = plan_info
                 next_state = step_fn(state, action)
                 next_obs_flat = flatten_obs(next_state.obs, obs_keys)
@@ -914,7 +1557,7 @@ def main() -> None:
                         f"val_loss={None if val_metrics is None else f'{val_metrics['loss']:.4f}'}"
                     )
 
-                visualizer.maybe_sleep(step_start_time)
+                visualizer.maybe_sleep(step_start_time, during_rollout=True)
                 if stop_requested or bool(jax.device_get(state.done)):
                     break
 
@@ -940,6 +1583,8 @@ def main() -> None:
                 f"success={episode_record['success']} "
                 f"final_dist={episode_record['final_distance']:.3f}"
             )
+            if not stop_requested:
+                visualizer.finish_episode()
             if stop_requested:
                 break
     except KeyboardInterrupt:
@@ -998,6 +1643,8 @@ def main() -> None:
         "data_path": str(args.data_path),
         "checkpoint_dir": str(checkpoint_dir),
         "save_dir": str(save_dir),
+        "planner_reward_mode": "analytic_env_shaping",
+        "online_batch_fraction": float(args.online_batch_fraction),
         "online_data_path": str(replay_path),
         "env_overrides": env_overrides,
         "global_steps": int(global_step),
@@ -1017,6 +1664,7 @@ def main() -> None:
     print(f"Saved final params to {save_dir / 'final_online_params.msgpack'}")
     print(f"Saved online transitions to {replay_path}")
     print(f"Saved metrics to {metrics_path}")
+    visualizer.replay_completed_episodes()
 
 
 if __name__ == "__main__":

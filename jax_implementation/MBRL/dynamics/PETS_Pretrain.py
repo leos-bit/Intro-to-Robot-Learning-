@@ -18,13 +18,14 @@ TARGET_DIM = OBS_DIM + 1
 STATS_CHUNK_ENVS = 8
 DEFAULT_DATA_PATH = (
     "jax_implementation/MBRL/dyn_data/"
-    "pets_pretrain_envB512_T10000_pid_noisy_seed0.npz"
+    "pets_pretrain_envB1024_T10000_pid_noisy_seed0.npz"
 )
 LOGVAR_REG_COEF = 1e-2
 GRAD_CLIP_NORM = 100.0
 LOGVAR_LOWER_BOUND = -10.0
 LOGVAR_UPPER_BOUND = 0.5
 LOGVAR_BOUND_EPS = 1e-6
+DYNAMICS_TARGET_DIM = OBS_DIM
 
 
 class MLP(nn.Module):
@@ -153,7 +154,7 @@ def split_observation(obs):
 
 
 class Dynamics_Model(nn.Module):
-    target_dim: int = 97
+    target_dim: int = TARGET_DIM
     trunk_widths: tuple[int, ...] = (256, 256, 256, 256)
     lidar_max_dist: float = 6.0
 
@@ -206,13 +207,23 @@ class Dynamics_Model(nn.Module):
 
 
 def load_arrays(data_path: str | Path) -> dict[str, np.ndarray]:
-    data = np.load(data_path)
-    return {
-        "obs": data["obs"],
-        "applied_action": data["applied_action"],
-        "next_obs": data["next_obs"],
-        "reward": data["reward"],
-    }
+    with np.load(data_path) as data:
+        action_key = "applied_action" if "applied_action" in data.files else "action"
+        if action_key not in data.files:
+            raise KeyError(
+                f"Dataset {data_path} must contain either 'applied_action' or 'action'."
+            )
+        reward = (
+            np.asarray(data["reward"], dtype=np.float32)
+            if "reward" in data.files
+            else np.zeros(data["obs"].shape[:2], dtype=np.float32)
+        )
+        return {
+            "obs": np.asarray(data["obs"], dtype=np.float32),
+            "applied_action": np.asarray(data[action_key], dtype=np.float32),
+            "next_obs": np.asarray(data["next_obs"], dtype=np.float32),
+            "reward": reward,
+        }
 
 
 def split_env_indices(
@@ -460,8 +471,8 @@ class EnsembleDynamics(nn.Module):
 
 def _logvar_reg(params) -> jnp.ndarray:
     model_params = params["VmapDynamics_Model_0"]
-    max_logvar = model_params["max_logvar"]
-    min_logvar = model_params["min_logvar"]
+    max_logvar = model_params["max_logvar"][:DYNAMICS_TARGET_DIM]
+    min_logvar = model_params["min_logvar"][:DYNAMICS_TARGET_DIM]
     return LOGVAR_REG_COEF * (jnp.sum(max_logvar) - jnp.sum(min_logvar))
 
 
@@ -469,17 +480,23 @@ def _logvar_reg(params) -> jnp.ndarray:
 def train_step(state, batch_x, batch_y, y_std):
     def loss_fn(params):
         mean, logvar = state.apply_fn({"params": params}, batch_x)  # (E,B,97), (E,B,97)
-        inv_var = jnp.exp(-logvar)
-        nll = jnp.sum((mean - batch_y) ** 2 * inv_var + logvar, axis=-1)
+        dyn_mean = mean[..., :DYNAMICS_TARGET_DIM]
+        dyn_logvar = logvar[..., :DYNAMICS_TARGET_DIM]
+        dyn_target = batch_y[..., :DYNAMICS_TARGET_DIM]
+        inv_var = jnp.exp(-dyn_logvar)
+        nll = jnp.sum((dyn_mean - dyn_target) ** 2 * inv_var + dyn_logvar, axis=-1)
         loss_per_model = jnp.mean(nll, axis=-1)   # (E,)
         loss = jnp.mean(loss_per_model)           # scalar
         logvar_reg = _logvar_reg(params)
         objective = loss + logvar_reg
-        mse_per_model = jnp.mean(jnp.square(mean - batch_y), axis=(1, 2))
-        raw_error = (mean - batch_y) * y_std[None, None, :]
-        raw_mse_per_model = jnp.mean(jnp.square(raw_error), axis=(1, 2))
-        raw_delta_mse_per_model = jnp.mean(jnp.square(raw_error[..., :OBS_DIM]), axis=(1, 2))
-        raw_reward_mse_per_model = jnp.mean(jnp.square(raw_error[..., OBS_DIM:]), axis=(1, 2))
+        mse_per_model = jnp.mean(jnp.square(dyn_mean - dyn_target), axis=(1, 2))
+        raw_delta_error = (dyn_mean - dyn_target) * y_std[None, None, :DYNAMICS_TARGET_DIM]
+        raw_reward_error = (mean[..., OBS_DIM:] - batch_y[..., OBS_DIM:]) * y_std[
+            None, None, OBS_DIM:
+        ]
+        raw_mse_per_model = jnp.mean(jnp.square(raw_delta_error), axis=(1, 2))
+        raw_delta_mse_per_model = raw_mse_per_model
+        raw_reward_mse_per_model = jnp.mean(jnp.square(raw_reward_error), axis=(1, 2))
         metrics = {
             "objective": objective,
             "loss": loss,
@@ -500,16 +517,22 @@ def train_step(state, batch_x, batch_y, y_std):
 @partial(jax.jit, static_argnames=("apply_fn",))
 def eval_step(params, apply_fn, batch_x, batch_y, y_std):
     mean, logvar = apply_fn({"params": params}, batch_x)
-    inv_var = jnp.exp(-logvar)
-    nll = jnp.sum((mean - batch_y) ** 2 * inv_var + logvar, axis=-1)
+    dyn_mean = mean[..., :DYNAMICS_TARGET_DIM]
+    dyn_logvar = logvar[..., :DYNAMICS_TARGET_DIM]
+    dyn_target = batch_y[..., :DYNAMICS_TARGET_DIM]
+    inv_var = jnp.exp(-dyn_logvar)
+    nll = jnp.sum((dyn_mean - dyn_target) ** 2 * inv_var + dyn_logvar, axis=-1)
     loss_per_model = jnp.mean(nll, axis=-1)
     loss = jnp.mean(loss_per_model)
     logvar_reg = _logvar_reg(params)
-    mse_per_model = jnp.mean(jnp.square(mean - batch_y), axis=(1, 2))
-    raw_error = (mean - batch_y) * y_std[None, None, :]
-    raw_mse_per_model = jnp.mean(jnp.square(raw_error), axis=(1, 2))
-    raw_delta_mse_per_model = jnp.mean(jnp.square(raw_error[..., :OBS_DIM]), axis=(1, 2))
-    raw_reward_mse_per_model = jnp.mean(jnp.square(raw_error[..., OBS_DIM:]), axis=(1, 2))
+    mse_per_model = jnp.mean(jnp.square(dyn_mean - dyn_target), axis=(1, 2))
+    raw_delta_error = (dyn_mean - dyn_target) * y_std[None, None, :DYNAMICS_TARGET_DIM]
+    raw_reward_error = (mean[..., OBS_DIM:] - batch_y[..., OBS_DIM:]) * y_std[
+        None, None, OBS_DIM:
+    ]
+    raw_mse_per_model = jnp.mean(jnp.square(raw_delta_error), axis=(1, 2))
+    raw_delta_mse_per_model = raw_mse_per_model
+    raw_reward_mse_per_model = jnp.mean(jnp.square(raw_reward_error), axis=(1, 2))
     metrics = {
         "objective": loss + logvar_reg,
         "loss": loss,
@@ -730,6 +753,7 @@ if __name__ == "__main__":
     save_params(save_dir / "final_params.msgpack", state.params)
     metrics_payload = {
         "data_path": str(args.data_path),
+        "loss_target": "state_delta_only",
         "train_ratio": float(args.train_ratio),
         "seed": int(args.seed),
         "ensemble_size": int(args.ensemble_size),

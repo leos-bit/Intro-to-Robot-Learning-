@@ -8,7 +8,7 @@ cd "${REPO_ROOT}"
 
 exec conda run --no-capture-output -n RLPR \
   python -u jax_implementation/MBRL/dynamics/PETS_MPC.py \
-  --render \
+  --render_completed_run \
   --real_time \
   --jit_step \
   "$@"
