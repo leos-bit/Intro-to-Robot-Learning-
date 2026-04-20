@@ -122,9 +122,9 @@ def default_config() -> config_dict.ConfigDict:
         ki_yaw=0.0,
         kd_yaw=0.35,
         max_tilt=0.45,
-        collective_limit=2.0,
-        attitude_limit=1.2,
-        yaw_limit=0.7,
+        collective_limit=10.0,
+        attitude_limit=10.0,
+        yaw_limit=3.14,
         outer_i_limit=2.0,
         inner_i_limit=1.0,
         policy_decim=1,
@@ -167,8 +167,13 @@ def default_config() -> config_dict.ConfigDict:
 
 
 class newDrone(mjx_env.MjxEnv):
-    def __init__(self, config: config_dict.ConfigDict = default_config(),
-      config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,):
+    def __init__(
+        self,
+        config: Optional[config_dict.ConfigDict] = None,
+        config_overrides: Optional[Dict[str, Union[str, int, list[Any]]]] = None,
+    ):
+            if config is None:
+                config = default_config()
             super().__init__(config, config_overrides)
 
             self._xml_path = str(Path(self._config.get("model_path", _XML_PATH)).resolve())

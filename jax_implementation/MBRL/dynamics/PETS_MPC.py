@@ -26,6 +26,7 @@ if str(_REPO_ROOT) not in sys.path:
 from jax_implementation.env import _sync_viewer_data, default_config, newDrone
 from jax_implementation.MBRL.dynamics.PETS_Pretrain import (
     ACTION_DIM,
+    Dynamics_Model,
     GRAD_CLIP_NORM,
     MAX_OBSTACLES,
     OBS_DIM,
@@ -55,6 +56,7 @@ LIDAR_SLICE = slice(17, 35)
 OBSTACLE_REL_SLICE = slice(35, 80)
 OBSTACLE_MASK_SLICE = slice(80, 95)
 HORIZONTAL_LIDAR_INDICES = np.asarray([0, 1, 2, 3, 6, 7, 8, 9], dtype=np.int32)
+AUTO_PLAN_TARGET_DT = 0.01
 
 
 @dataclass
@@ -203,6 +205,33 @@ def _softmin(x: jax.Array, temperature: jax.Array) -> jax.Array:
     x = jnp.asarray(x, dtype=jnp.float32)
     tau = jnp.maximum(jnp.asarray(temperature, dtype=jnp.float32), 1e-3)
     return -tau * jax.nn.logsumexp(-x / tau, axis=-1)
+
+
+def _shift_plan_buffers(
+    mean: jax.Array,
+    std: jax.Array,
+    init_std: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    shifted_mean = jnp.concatenate(
+        [mean[1:], jnp.zeros((1, ACTION_DIM), dtype=jnp.float32)],
+        axis=0,
+    )
+    shifted_std = jnp.concatenate(
+        [
+            std[1:],
+            jnp.full((1, ACTION_DIM), init_std, dtype=jnp.float32),
+        ],
+        axis=0,
+    )
+    return shifted_mean, shifted_std
+
+
+def _resolve_plan_every(requested_steps: int, ctrl_dt: float) -> int:
+    if requested_steps > 0:
+        return int(requested_steps)
+    if ctrl_dt <= 0.0:
+        return 1
+    return max(1, int(round(AUTO_PLAN_TARGET_DT / ctrl_dt)))
 
 
 def _split_rollout_obs(obs: jax.Array) -> dict[str, jax.Array]:
@@ -721,6 +750,7 @@ def build_rollout_eval_fn(
     gamma: float,
     deterministic_rollouts: bool,
 ):
+    del apply_fn
     x_mean_j = jnp.asarray(x_mean, dtype=jnp.float32)
     x_std_j = jnp.asarray(x_std, dtype=jnp.float32)
     y_mean_j = jnp.asarray(y_mean, dtype=jnp.float32)
@@ -811,6 +841,23 @@ def build_rollout_eval_fn(
             dtype=jnp.float32,
         ),
     }
+    single_model = Dynamics_Model()
+
+    def _apply_selected_models(
+        params,
+        model_x: jax.Array,
+        model_ids_flat: jax.Array,
+    ) -> tuple[jax.Array, jax.Array]:
+        ensemble_params = params["VmapDynamics_Model_0"]
+
+        def _apply_one(single_x: jax.Array, model_id: jax.Array):
+            member_params = jax.tree_util.tree_map(
+                lambda leaf: leaf[model_id],
+                ensemble_params,
+            )
+            return single_model.apply({"params": member_params}, single_x)
+
+        return jax.vmap(_apply_one)(model_x, model_ids_flat)
 
     @jax.jit
     def _evaluate(
@@ -895,18 +942,15 @@ def build_rollout_eval_fn(
             act_flat = model_action.reshape(population * num_particles, ACTION_DIM)
             model_x = jnp.concatenate([obs_flat, act_flat], axis=-1)
             model_x = (model_x - x_mean_j) / x_std_j
-            model_x = jnp.broadcast_to(
-                model_x[None, :, :],
-                (ensemble_size, model_x.shape[0], model_x.shape[-1]),
-            )
-            mean_norm, logvar_norm = apply_fn({"params": params}, model_x)
             flat_ids = model_ids.reshape(-1)
-            sample_ids = jnp.arange(obs_flat.shape[0], dtype=jnp.int32)
-            chosen_mean_norm = mean_norm[flat_ids, sample_ids]
+            chosen_mean_norm, chosen_logvar_norm = _apply_selected_models(
+                params,
+                model_x,
+                flat_ids,
+            )
             if deterministic_rollouts:
                 chosen_target_norm = chosen_mean_norm
             else:
-                chosen_logvar_norm = logvar_norm[flat_ids, sample_ids]
                 chosen_std_norm = jnp.exp(0.5 * chosen_logvar_norm)
                 noise = jax.random.normal(
                     noise_key_t,
@@ -1032,6 +1076,10 @@ class PETSCEMPlanner:
         self.action_high = jnp.asarray(action_high, dtype=jnp.float32)
         self.mean = jnp.zeros((self.horizon, ACTION_DIM), dtype=jnp.float32)
         self.std = jnp.full((self.horizon, ACTION_DIM), self.init_std, dtype=jnp.float32)
+        self._alpha_j = jnp.asarray(self.alpha, dtype=jnp.float32)
+        self._one_minus_alpha_j = jnp.asarray(1.0 - self.alpha, dtype=jnp.float32)
+        self._min_std_j = jnp.asarray(self.min_std, dtype=jnp.float32)
+        self._init_std_j = jnp.asarray(self.init_std, dtype=jnp.float32)
         self.evaluate_sequences = build_rollout_eval_fn(
             apply_fn=apply_fn,
             ensemble_size=ensemble_size,
@@ -1047,6 +1095,79 @@ class PETSCEMPlanner:
             gamma=gamma,
             deterministic_rollouts=deterministic_rollouts,
         )
+        self._plan_impl = jax.jit(self._build_plan_impl())
+
+    def _build_plan_impl(self):
+        population_size = self.population_size
+        horizon = self.horizon
+        iterations = self.iterations
+        elite_size = self.elite_size
+        action_low = self.action_low
+        action_high = self.action_high
+        alpha_j = self._alpha_j
+        one_minus_alpha_j = self._one_minus_alpha_j
+        min_std_j = self._min_std_j
+        init_std_j = self._init_std_j
+        evaluate_sequences = self.evaluate_sequences
+
+        def _plan_impl(
+            params,
+            obs: jax.Array,
+            rollout_state: dict[str, jax.Array],
+            mean0: jax.Array,
+            std0: jax.Array,
+            rng0: jax.Array,
+        ):
+            init_best = jnp.asarray(-np.inf, dtype=jnp.float32)
+
+            def _cem_step(carry, _):
+                mean, std, best_score, rng = carry
+                rng, sample_key, eval_key = jax.random.split(rng, 3)
+                noise = jax.random.normal(
+                    sample_key,
+                    shape=(population_size, horizon, ACTION_DIM),
+                    dtype=jnp.float32,
+                )
+                action_sequences = mean[None, :, :] + (std[None, :, :] * noise)
+                action_sequences = jnp.clip(
+                    action_sequences,
+                    action_low[None, None, :],
+                    action_high[None, None, :],
+                )
+                scores = evaluate_sequences(
+                    params,
+                    obs,
+                    rollout_state,
+                    action_sequences,
+                    eval_key,
+                )
+                elite_scores, elite_idx = jax.lax.top_k(scores, elite_size)
+                elite_actions = action_sequences[elite_idx]
+                elite_mean = jnp.mean(elite_actions, axis=0)
+                elite_std = jnp.std(elite_actions, axis=0)
+                next_mean = (alpha_j * mean) + (one_minus_alpha_j * elite_mean)
+                next_std = jnp.maximum(
+                    (alpha_j * std) + (one_minus_alpha_j * elite_std),
+                    min_std_j,
+                )
+                next_best = jnp.maximum(best_score, elite_scores[0])
+                return (next_mean, next_std, next_best, rng), None
+
+            (mean, std, best_score, rng), _ = jax.lax.scan(
+                _cem_step,
+                (mean0, std0, init_best, rng0),
+                xs=None,
+                length=iterations,
+            )
+            action = jnp.asarray(mean[0], dtype=jnp.float32)
+            shifted_mean, shifted_std = _shift_plan_buffers(mean, std, init_std_j)
+            info = {
+                "best_return": best_score,
+                "mean_action_std": jnp.mean(std),
+            }
+            return action, shifted_mean, shifted_std, info, rng
+
+        return _plan_impl
 
     def reset(self) -> None:
         self.mean = jnp.zeros((self.horizon, ACTION_DIM), dtype=jnp.float32)
@@ -1061,61 +1182,30 @@ class PETSCEMPlanner:
         rollout_state: dict[str, jax.Array],
         rng: jax.Array,
     ) -> tuple[jax.Array, dict[str, float], jax.Array]:
-        mean = self.mean
-        std = self.std
-        best_score = -np.inf
-
-        for _ in range(self.iterations):
-            rng, sample_key, eval_key = jax.random.split(rng, 3)
-            noise = jax.random.normal(
-                sample_key,
-                shape=(self.population_size, self.horizon, ACTION_DIM),
-                dtype=jnp.float32,
-            )
-            action_sequences = mean[None, :, :] + (std[None, :, :] * noise)
-            action_sequences = jnp.clip(
-                action_sequences,
-                self.action_low[None, None, :],
-                self.action_high[None, None, :],
-            )
-            scores = self.evaluate_sequences(
-                self.params,
-                obs,
-                rollout_state,
-                action_sequences,
-                eval_key,
-            )
-            action_sequences_np = np.asarray(jax.device_get(action_sequences), dtype=np.float32)
-            scores_np = np.asarray(jax.device_get(scores), dtype=np.float32)
-            elite_idx = np.argpartition(scores_np, -self.elite_size)[-self.elite_size :]
-            elite_actions = action_sequences_np[elite_idx]
-            elite_mean = np.mean(elite_actions, axis=0, dtype=np.float32)
-            elite_std = np.std(elite_actions, axis=0, dtype=np.float32)
-            mean = (self.alpha * mean) + ((1.0 - self.alpha) * jnp.asarray(elite_mean))
-            std = (self.alpha * std) + ((1.0 - self.alpha) * jnp.asarray(elite_std))
-            std = jnp.maximum(std, self.min_std)
-            iter_best = float(scores_np[np.argmax(scores_np)])
-            best_score = max(best_score, iter_best)
-
-        action = jnp.asarray(mean[0], dtype=jnp.float32)
-        shifted_mean = jnp.concatenate(
-            [mean[1:], jnp.zeros((1, ACTION_DIM), dtype=jnp.float32)],
-            axis=0,
-        )
-        shifted_std = jnp.concatenate(
-            [
-                std[1:],
-                jnp.full((1, ACTION_DIM), self.init_std, dtype=jnp.float32),
-            ],
-            axis=0,
+        action, shifted_mean, shifted_std, info_jax, rng = self._plan_impl(
+            self.params,
+            obs,
+            rollout_state,
+            self.mean,
+            self.std,
+            rng,
         )
         self.mean = shifted_mean
         self.std = shifted_std
         info = {
-            "best_return": float(best_score),
-            "mean_action_std": float(jnp.mean(std)),
+            "best_return": float(jax.device_get(info_jax["best_return"])),
+            "mean_action_std": float(jax.device_get(info_jax["mean_action_std"])),
         }
         return action, info, rng
+
+    def advance_open_loop(self) -> jax.Array:
+        action = jnp.asarray(self.mean[0], dtype=jnp.float32)
+        self.mean, self.std = _shift_plan_buffers(
+            self.mean,
+            self.std,
+            self._init_std_j,
+        )
+        return action
 
 
 class PETSVisualizer:
@@ -1297,8 +1387,17 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val_batch_size", type=int, default=8192)
     parser.add_argument("--val_batches", type=int, default=32)
     parser.add_argument("--num_episodes", type=int, default=10)
-    parser.add_argument("--max_steps", type=int, default=1000)
-    parser.add_argument("--plan_horizon", type=int, default=20)
+    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--plan_horizon", type=int, default=300)
+    parser.add_argument(
+        "--plan_every",
+        type=int,
+        default=0,
+        help=(
+            "Replan every N env steps and execute the cached sequence in between. "
+            "Use 0 to auto-target roughly 100 Hz replanning."
+        ),
+    )
     parser.add_argument("--cem_population", type=int, default=512)
     parser.add_argument("--cem_elites", type=int, default=64)
     parser.add_argument("--cem_iterations", type=int, default=6)
@@ -1369,6 +1468,14 @@ def main() -> None:
     env = newDrone(config=cfg)
     obs_keys = tuple(env.obs_spec.keys())
     obs_low, obs_high = build_flat_obs_bounds(env, obs_keys)
+    ctrl_dt = float(getattr(env, "_ctrl_dt", cfg.get("ctrl_dt", 0.0)))
+    plan_every = _resolve_plan_every(args.plan_every, ctrl_dt)
+    if args.plan_every <= 0:
+        plan_hz = 0.0 if ctrl_dt <= 0.0 else (1.0 / (plan_every * ctrl_dt))
+        print(
+            f"[planner] Auto-selected plan_every={plan_every} "
+            f"for ctrl_dt={ctrl_dt:.4f}s ({plan_hz:.1f} Hz replanning)."
+        )
     visualizer = PETSVisualizer(
         env=env,
         render_live=args.render,
@@ -1477,6 +1584,7 @@ def main() -> None:
                 print("Viewer closed, stopping PETS run.")
                 stop_requested = True
                 break
+            force_replan = True
             episode_return = 0.0
             step_count = 0
             last_plan_info = {"best_return": 0.0, "mean_action_std": float(args.init_std)}
@@ -1485,13 +1593,18 @@ def main() -> None:
             for step_id in range(args.max_steps):
                 step_start_time = time.perf_counter()
                 obs_flat = flatten_obs(state.obs, obs_keys)
-                rollout_state = build_rollout_reward_state(state.info)
-                action, plan_info, plan_rng = planner.plan(
-                    obs_flat,
-                    rollout_state,
-                    plan_rng,
-                )
-                last_plan_info = plan_info
+                if force_replan or (step_id % plan_every) == 0:
+                    rollout_state = build_rollout_reward_state(state.info)
+                    action, plan_info, plan_rng = planner.plan(
+                        obs_flat,
+                        rollout_state,
+                        plan_rng,
+                    )
+                    last_plan_info = plan_info
+                    force_replan = False
+                else:
+                    action = planner.advance_open_loop()
+                    plan_info = last_plan_info
                 next_state = step_fn(state, action)
                 next_obs_flat = flatten_obs(next_state.obs, obs_keys)
                 applied_action = np.asarray(
@@ -1538,6 +1651,7 @@ def main() -> None:
                         max_batches=args.val_batches,
                     )
                     planner.set_params(trainer.state.params)
+                    force_replan = True
                     retrain_record = {
                         "global_step": global_step,
                         "online_transitions": replay.online_size,
