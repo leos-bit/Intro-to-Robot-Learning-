@@ -57,6 +57,84 @@ OBSTACLE_REL_SLICE = slice(35, 80)
 OBSTACLE_MASK_SLICE = slice(80, 95)
 HORIZONTAL_LIDAR_INDICES = np.asarray([0, 1, 2, 3, 6, 7, 8, 9], dtype=np.int32)
 AUTO_PLAN_TARGET_DT = 0.01
+AUTO_PLAN_TARGET_DT_CPU = 0.05
+AUTO_PLAN_WORK_UNITS_REF = float(300 * 256 * 8)
+CPU_PLANNER_WORK_UNITS_WARN = int(160 * 256 * 8)
+
+
+@dataclass(frozen=True)
+class RuntimePreset:
+    description: str
+    values: dict[str, Any]
+
+
+RUNTIME_PRESETS: dict[str, RuntimePreset] = {
+    "fast": RuntimePreset(
+        description="CPU-friendly preset for quick iteration and smoke tests.",
+        values={
+            "batch_size": 1024,
+            "retrain_updates": 64,
+            "retrain_every": 500,
+            "warmup_online_steps": 500,
+            "val_batch_size": 4096,
+            "val_batches": 4,
+            "plan_horizon": 96,
+            "cem_population": 128,
+            "cem_elites": 16,
+            "cem_iterations": 4,
+            "num_particles": 6,
+            "print_every": 50,
+        },
+    ),
+    "balanced": RuntimePreset(
+        description="Moderate runtime preset for accelerators or longer runs.",
+        values={
+            "batch_size": 1536,
+            "retrain_updates": 128,
+            "retrain_every": 400,
+            "warmup_online_steps": 400,
+            "val_batch_size": 4096,
+            "val_batches": 8,
+            "plan_horizon": 160,
+            "cem_population": 256,
+            "cem_elites": 32,
+            "cem_iterations": 5,
+            "num_particles": 8,
+            "print_every": 25,
+        },
+    ),
+    "full": RuntimePreset(
+        description="Original heavier PETS settings.",
+        values={
+            "batch_size": 2048,
+            "retrain_updates": 250,
+            "retrain_every": 250,
+            "warmup_online_steps": 250,
+            "val_batch_size": 8192,
+            "val_batches": 32,
+            "plan_horizon": 300,
+            "cem_population": 512,
+            "cem_elites": 64,
+            "cem_iterations": 6,
+            "num_particles": 20,
+            "print_every": 25,
+        },
+    ),
+}
+PRESET_MANAGED_FLAGS = {
+    "batch_size": "--batch_size",
+    "retrain_updates": "--retrain_updates",
+    "retrain_every": "--retrain_every",
+    "warmup_online_steps": "--warmup_online_steps",
+    "val_batch_size": "--val_batch_size",
+    "val_batches": "--val_batches",
+    "plan_horizon": "--plan_horizon",
+    "cem_population": "--cem_population",
+    "cem_elites": "--cem_elites",
+    "cem_iterations": "--cem_iterations",
+    "num_particles": "--num_particles",
+    "print_every": "--print_every",
+}
 
 
 @dataclass
@@ -226,12 +304,159 @@ def _shift_plan_buffers(
     return shifted_mean, shifted_std
 
 
-def _resolve_plan_every(requested_steps: int, ctrl_dt: float) -> int:
+def _resolve_plan_every(
+    requested_steps: int,
+    ctrl_dt: float,
+    plan_horizon: int,
+    population_size: int,
+    num_particles: int,
+    device_platform: str,
+) -> tuple[int, float, float]:
     if requested_steps > 0:
-        return int(requested_steps)
+        return int(requested_steps), 0.0, 1.0
     if ctrl_dt <= 0.0:
-        return 1
-    return max(1, int(round(AUTO_PLAN_TARGET_DT / ctrl_dt)))
+        return 1, 0.0, 1.0
+    base_target_dt = (
+        AUTO_PLAN_TARGET_DT_CPU if device_platform == "cpu" else AUTO_PLAN_TARGET_DT
+    )
+    work_units = float(max(plan_horizon, 1) * max(population_size, 1) * max(num_particles, 1))
+    workload_scale = max(1.0, float(np.sqrt(work_units / AUTO_PLAN_WORK_UNITS_REF)))
+    target_dt = base_target_dt * workload_scale
+    plan_every = max(1, int(round(target_dt / ctrl_dt)))
+    return plan_every, target_dt, workload_scale
+
+
+def _flag_was_passed(argv: list[str], flag: str) -> bool:
+    return any(arg == flag or arg.startswith(f"{flag}=") for arg in argv)
+
+
+def _resolve_runtime_preset_name(requested_preset: str, device_platform: str) -> str:
+    if requested_preset != "auto":
+        return requested_preset
+    if device_platform == "cpu":
+        return "fast"
+    return "balanced"
+
+
+def _apply_runtime_preset(
+    args: argparse.Namespace,
+    argv: list[str],
+    preset_name: str,
+) -> dict[str, Any]:
+    applied: dict[str, Any] = {}
+    preset = RUNTIME_PRESETS[preset_name]
+    for field_name, flag_name in PRESET_MANAGED_FLAGS.items():
+        if _flag_was_passed(argv, flag_name):
+            continue
+        target_value = preset.values[field_name]
+        if getattr(args, field_name) == target_value:
+            continue
+        setattr(args, field_name, target_value)
+        applied[field_name] = target_value
+    return applied
+
+
+def _planner_work_units(
+    plan_horizon: int,
+    population_size: int,
+    num_particles: int,
+) -> int:
+    return int(max(plan_horizon, 1) * max(population_size, 1) * max(num_particles, 1))
+
+
+def _describe_render_mode(render_live: bool, render_completed_run: bool) -> str:
+    if render_live:
+        return "live"
+    if render_completed_run:
+        return "replay"
+    return "headless"
+
+
+def _log_runtime_config(
+    *,
+    requested_preset: str,
+    effective_preset: str,
+    planner_platform: str,
+    preset_updates: dict[str, Any],
+    args: argparse.Namespace,
+    plan_every: int,
+    plan_hz: float,
+) -> None:
+    work_units = _planner_work_units(
+        args.plan_horizon,
+        args.cem_population,
+        args.num_particles,
+    )
+    preset_desc = RUNTIME_PRESETS[effective_preset].description
+    preset_label = effective_preset
+    if requested_preset == "auto":
+        preset_label = f"auto->{effective_preset}"
+    print(
+        f"[runtime] preset={preset_label} platform={planner_platform} "
+        f"mode={_describe_render_mode(args.render, args.render_completed_run)} "
+        f"jit_step={args.jit_step} {preset_desc}"
+    )
+    if preset_updates:
+        applied_parts = ", ".join(
+            f"{key}={preset_updates[key]}"
+            for key in PRESET_MANAGED_FLAGS
+            if key in preset_updates
+        )
+        print(f"[runtime] auto-applied preset defaults: {applied_parts}")
+    print(
+        f"[runtime] planner horizon={args.plan_horizon} pop={args.cem_population} "
+        f"elites={args.cem_elites} iter={args.cem_iterations} particles={args.num_particles} "
+        f"plan_every={plan_every} plan_hz={plan_hz:.1f} work_units={work_units:,}"
+    )
+    print(
+        f"[runtime] retrain batch={args.batch_size} updates={args.retrain_updates} "
+        f"every={args.retrain_every} warmup={args.warmup_online_steps} "
+        f"val_batch={args.val_batch_size} val_batches={args.val_batches}"
+    )
+    if planner_platform == "cpu" and work_units > CPU_PLANNER_WORK_UNITS_WARN:
+        print(
+            "[runtime] Warning: planner workload is still large for CPU. "
+            "If this feels slow, try --preset fast or lower "
+            "--plan_horizon/--cem_population/--num_particles."
+        )
+
+
+def _resolve_jax_platform() -> str:
+    try:
+        devices = jax.devices()
+        if not devices:
+            return "unknown"
+        platform = devices[0].platform
+        if os.environ.get("PETS_MPC_CPU_FALLBACK") == "1":
+            print("[jax] Using CPU fallback after backend initialization failed.")
+        return platform
+    except RuntimeError as exc:
+        if os.environ.get("PETS_MPC_CPU_FALLBACK") == "1" or os.environ.get("JAX_PLATFORMS"):
+            raise
+        message = str(exc)
+        if (
+            "Unable to initialize backend" not in message
+            and "No visible GPU devices" not in message
+        ):
+            raise
+        print(
+            "[jax] Backend init failed, restarting with JAX_PLATFORMS=cpu. "
+            "Set JAX_PLATFORMS yourself to force a different backend."
+        )
+        next_env = dict(os.environ)
+        next_env["JAX_PLATFORMS"] = "cpu"
+        next_env["PETS_MPC_CPU_FALLBACK"] = "1"
+        os.execvpe(sys.executable, [sys.executable, *sys.argv], next_env)
+        raise AssertionError("unreachable")
+
+
+def _log_startup(message: str) -> None:
+    print(f"[startup] {message}", flush=True)
+
+
+def _log_debug(enabled: bool, message: str) -> None:
+    if enabled:
+        print(f"[debug] {message}", flush=True)
 
 
 def _split_rollout_obs(obs: jax.Array) -> dict[str, jax.Array]:
@@ -344,12 +569,37 @@ class OnlineReplayBuffer:
         next_obs: np.ndarray,
         reward: float,
     ) -> None:
-        self._online_obs_parts.append(np.asarray(obs, dtype=np.float32).reshape(1, OBS_DIM))
-        self._online_action_parts.append(np.asarray(action, dtype=np.float32).reshape(1, ACTION_DIM))
-        self._online_next_obs_parts.append(
-            np.asarray(next_obs, dtype=np.float32).reshape(1, OBS_DIM)
+        self.add_transition_block(
+            obs=np.asarray(obs, dtype=np.float32).reshape(1, OBS_DIM),
+            action=np.asarray(action, dtype=np.float32).reshape(1, ACTION_DIM),
+            next_obs=np.asarray(next_obs, dtype=np.float32).reshape(1, OBS_DIM),
+            reward=np.asarray([reward], dtype=np.float32),
         )
-        self._online_reward_parts.append(np.asarray([reward], dtype=np.float32))
+
+    def add_transition_block(
+        self,
+        obs: np.ndarray,
+        action: np.ndarray,
+        next_obs: np.ndarray,
+        reward: np.ndarray,
+    ) -> None:
+        obs_block = np.asarray(obs, dtype=np.float32).reshape(-1, OBS_DIM)
+        action_block = np.asarray(action, dtype=np.float32).reshape(-1, ACTION_DIM)
+        next_obs_block = np.asarray(next_obs, dtype=np.float32).reshape(-1, OBS_DIM)
+        reward_block = np.asarray(reward, dtype=np.float32).reshape(-1)
+        block_size = int(obs_block.shape[0])
+        if (
+            action_block.shape[0] != block_size
+            or next_obs_block.shape[0] != block_size
+            or reward_block.shape[0] != block_size
+        ):
+            raise ValueError("Replay transition block arrays must share the same leading size.")
+        if block_size <= 0:
+            return
+        self._online_obs_parts.append(obs_block)
+        self._online_action_parts.append(action_block)
+        self._online_next_obs_parts.append(next_obs_block)
+        self._online_reward_parts.append(reward_block)
         self._online_cache = None
 
     def _build_online_cache(self) -> dict[str, np.ndarray]:
@@ -448,6 +698,51 @@ class OnlineReplayBuffer:
             metadata_json=np.asarray(json.dumps(metadata), dtype=np.str_),
         )
         return path
+
+
+class PendingReplayBuffer:
+    def __init__(self) -> None:
+        self.clear()
+
+    @property
+    def size(self) -> int:
+        return self._size
+
+    def add_transition(
+        self,
+        obs: jax.Array,
+        action: jax.Array,
+        next_obs: jax.Array,
+        reward: jax.Array,
+    ) -> None:
+        self._obs_parts.append(jnp.asarray(obs, dtype=jnp.float32).reshape(1, OBS_DIM))
+        self._action_parts.append(jnp.asarray(action, dtype=jnp.float32).reshape(1, ACTION_DIM))
+        self._next_obs_parts.append(jnp.asarray(next_obs, dtype=jnp.float32).reshape(1, OBS_DIM))
+        self._reward_parts.append(jnp.asarray(reward, dtype=jnp.float32).reshape(1))
+        self._size += 1
+
+    def flush_into(self, replay: OnlineReplayBuffer) -> int:
+        if self._size <= 0:
+            return 0
+        obs_block, action_block, next_obs_block, reward_block = jax.device_get(
+            (
+                jnp.concatenate(self._obs_parts, axis=0),
+                jnp.concatenate(self._action_parts, axis=0),
+                jnp.concatenate(self._next_obs_parts, axis=0),
+                jnp.concatenate(self._reward_parts, axis=0),
+            )
+        )
+        replay.add_transition_block(obs_block, action_block, next_obs_block, reward_block)
+        flushed = self._size
+        self.clear()
+        return flushed
+
+    def clear(self) -> None:
+        self._obs_parts: list[jax.Array] = []
+        self._action_parts: list[jax.Array] = []
+        self._next_obs_parts: list[jax.Array] = []
+        self._reward_parts: list[jax.Array] = []
+        self._size = 0
 
 
 class PETSEnsembleTrainer:
@@ -1181,7 +1476,7 @@ class PETSCEMPlanner:
         obs: jax.Array,
         rollout_state: dict[str, jax.Array],
         rng: jax.Array,
-    ) -> tuple[jax.Array, dict[str, float], jax.Array]:
+    ) -> tuple[jax.Array, dict[str, jax.Array], jax.Array]:
         action, shifted_mean, shifted_std, info_jax, rng = self._plan_impl(
             self.params,
             obs,
@@ -1192,11 +1487,7 @@ class PETSCEMPlanner:
         )
         self.mean = shifted_mean
         self.std = shifted_std
-        info = {
-            "best_return": float(jax.device_get(info_jax["best_return"])),
-            "mean_action_std": float(jax.device_get(info_jax["mean_action_std"])),
-        }
-        return action, info, rng
+        return action, info_jax, rng
 
     def advance_open_loop(self) -> jax.Array:
         action = jnp.asarray(self.mean[0], dtype=jnp.float32)
@@ -1298,13 +1589,13 @@ class PETSVisualizer:
         episode_id: int,
         step_id: int,
         state,
-        episode_return: float,
-        plan_info: dict[str, float],
+        done: bool,
+        episode_return,
+        plan_info: dict[str, Any],
         action: jax.Array,
     ) -> None:
         if self.print_every <= 0:
             return
-        done = bool(jax.device_get(state.done))
         if (step_id % self.print_every) != 0 and not done:
             return
         info = state.info
@@ -1313,10 +1604,12 @@ class PETSVisualizer:
         dist = float(jax.device_get(info["distance"]))
         reward = float(jax.device_get(state.reward))
         action_np = np.asarray(jax.device_get(action), dtype=np.float32)
+        episode_return_value = float(jax.device_get(episode_return))
+        plan_best_return = float(jax.device_get(plan_info["best_return"]))
         print(
             f"ep={episode_id:02d} step={step_id:04d} "
-            f"reward={reward: .3f} return={episode_return: .3f} "
-            f"dist={dist: .3f} plan={plan_info['best_return']: .3f} "
+            f"reward={reward: .3f} return={episode_return_value: .3f} "
+            f"dist={dist: .3f} plan={plan_best_return: .3f} "
             f"act={np.round(action_np, 3)} pos={np.round(pos, 3)} vel={np.round(vel, 3)}"
         )
 
@@ -1367,6 +1660,15 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Run PETS with MPC + CEM on the pretrained dynamics ensemble and periodic online retraining.",
     )
+    parser.add_argument(
+        "--preset",
+        choices=["auto", *RUNTIME_PRESETS.keys()],
+        default="auto",
+        help=(
+            "Runtime preset. 'auto' picks 'fast' on CPU and 'balanced' elsewhere. "
+            "Explicit CLI flags still override preset-managed values."
+        ),
+    )
     parser.add_argument("--data_path", type=str, default=DEFAULT_DATA_PATH)
     parser.add_argument("--checkpoint_dir", type=str, default=DEFAULT_CHECKPOINT_DIR)
     parser.add_argument("--save_dir", type=str, default=DEFAULT_SAVE_DIR)
@@ -1395,7 +1697,7 @@ def _build_parser() -> argparse.ArgumentParser:
         default=0,
         help=(
             "Replan every N env steps and execute the cached sequence in between. "
-            "Use 0 to auto-target roughly 100 Hz replanning."
+            "Use 0 to auto-pick a cadence from ctrl_dt, planner workload, and device type."
         ),
     )
     parser.add_argument("--cem_population", type=int, default=512)
@@ -1409,7 +1711,19 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--deterministic_rollouts", action="store_true")
     parser.add_argument("--use_final_params", action="store_true")
     parser.add_argument("--train_ratio", type=float, default=0.9)
-    parser.add_argument("--jit_step", action="store_true")
+    parser.add_argument(
+        "--jit_step",
+        dest="jit_step",
+        action="store_true",
+        help="JIT-compile env.step for faster rollouts (default).",
+    )
+    parser.add_argument(
+        "--no_jit_step",
+        dest="jit_step",
+        action="store_false",
+        help="Disable env.step JIT compilation.",
+    )
+    parser.set_defaults(jit_step=True)
     parser.add_argument("--render", action="store_true", help="Open a live MuJoCo viewer.")
     parser.add_argument(
         "--render_completed_run",
@@ -1428,6 +1742,11 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Console logging cadence in env steps. Use 0 to disable.",
     )
     parser.add_argument(
+        "--debug_prints",
+        action="store_true",
+        help="Print extra startup/debug information around data loading, JIT, and rollout progress.",
+    )
+    parser.add_argument(
         "--env_override",
         action="append",
         default=[],
@@ -1437,7 +1756,21 @@ def _build_parser() -> argparse.ArgumentParser:
 
 
 def main() -> None:
-    args = _build_parser().parse_args()
+    raw_argv = sys.argv[1:]
+    args = _build_parser().parse_args(raw_argv)
+    planner_platform = _resolve_jax_platform()
+    requested_preset = args.preset
+    effective_preset = _resolve_runtime_preset_name(requested_preset, planner_platform)
+    preset_updates = _apply_runtime_preset(args, raw_argv, effective_preset)
+    if (
+        args.cem_elites > args.cem_population
+        and not _flag_was_passed(raw_argv, "--cem_elites")
+    ):
+        print(
+            f"[planner] Auto-clamping cem_elites from {args.cem_elites} "
+            f"to {args.cem_population} to match --cem_population."
+        )
+        args.cem_elites = args.cem_population
     if args.cem_elites <= 0 or args.cem_elites > args.cem_population:
         raise ValueError("--cem_elites must be in [1, --cem_population].")
     if args.cem_population <= 0:
@@ -1469,13 +1802,33 @@ def main() -> None:
     obs_keys = tuple(env.obs_spec.keys())
     obs_low, obs_high = build_flat_obs_bounds(env, obs_keys)
     ctrl_dt = float(getattr(env, "_ctrl_dt", cfg.get("ctrl_dt", 0.0)))
-    plan_every = _resolve_plan_every(args.plan_every, ctrl_dt)
+    plan_every, target_plan_dt, workload_scale = _resolve_plan_every(
+        args.plan_every,
+        ctrl_dt,
+        args.plan_horizon,
+        args.cem_population,
+        args.num_particles,
+        planner_platform,
+    )
+    plan_hz = 0.0 if ctrl_dt <= 0.0 else (1.0 / (plan_every * ctrl_dt))
     if args.plan_every <= 0:
-        plan_hz = 0.0 if ctrl_dt <= 0.0 else (1.0 / (plan_every * ctrl_dt))
         print(
             f"[planner] Auto-selected plan_every={plan_every} "
-            f"for ctrl_dt={ctrl_dt:.4f}s ({plan_hz:.1f} Hz replanning)."
+            f"for ctrl_dt={ctrl_dt:.4f}s on {planner_platform} "
+            f"(target_dt={target_plan_dt:.3f}s, workload_scale={workload_scale:.2f}, "
+            f"{plan_hz:.1f} Hz replanning)."
         )
+    _log_runtime_config(
+        requested_preset=requested_preset,
+        effective_preset=effective_preset,
+        planner_platform=planner_platform,
+        preset_updates=preset_updates,
+        args=args,
+        plan_every=plan_every,
+        plan_hz=plan_hz,
+    )
+    if env_overrides:
+        _log_debug(args.debug_prints, f"Applied env overrides: {env_overrides}")
     visualizer = PETSVisualizer(
         env=env,
         render_live=args.render,
@@ -1484,32 +1837,50 @@ def main() -> None:
         print_every=args.print_every,
     )
 
+    _log_startup(f"Loading dataset from {args.data_path}")
     arrays = load_arrays(args.data_path)
+    _log_debug(
+        args.debug_prints,
+        (
+            "Loaded arrays: "
+            f"obs={arrays['obs'].shape}, applied_action={arrays['applied_action'].shape}, "
+            f"next_obs={arrays['next_obs'].shape}, reward={arrays['reward'].shape}"
+        ),
+    )
     train_idx_path = checkpoint_dir / "train_idx.npy"
     test_idx_path = checkpoint_dir / "test_idx.npy"
     norm_stats_path = checkpoint_dir / "normalization_stats.npz"
     if train_idx_path.exists() and test_idx_path.exists():
+        _log_startup(f"Loading train/test splits from {checkpoint_dir}")
         train_idx = np.load(train_idx_path)
         test_idx = np.load(test_idx_path)
     else:
+        _log_startup("Building train/test splits from dataset")
         train_idx, test_idx = split_env_indices(
             num_envs=arrays["obs"].shape[0],
             train_ratio=args.train_ratio,
             seed=args.seed,
         )
     if norm_stats_path.exists():
+        _log_startup(f"Loading normalization stats from {norm_stats_path}")
         norm_stats = load_norm_stats(norm_stats_path)
     else:
+        _log_startup("Computing normalization stats from training split")
         norm_stats = compute_normalization_stats(arrays, train_idx)
 
     train_transitions = flatten_transition_block(arrays, train_idx)
     val_transitions = flatten_transition_block(arrays, test_idx)
+    _log_startup(
+        "Prepared flattened transitions "
+        f"(train={train_transitions['reward'].shape[0]:,}, val={val_transitions['reward'].shape[0]:,})"
+    )
     replay = OnlineReplayBuffer(
         base_obs=train_transitions["obs"],
         base_action=train_transitions["action"],
         base_next_obs=train_transitions["next_obs"],
         base_reward=train_transitions["reward"],
     )
+    pending_replay = PendingReplayBuffer()
 
     init_params_name = "final_params.msgpack" if args.use_final_params else "best_params.msgpack"
     init_params_path = checkpoint_dir / init_params_name
@@ -1519,6 +1890,7 @@ def main() -> None:
             "Run PETS_Pretrain.py first or point --checkpoint_dir to an existing run."
         )
 
+    _log_startup(f"Loading pretrained params from {init_params_path}")
     trainer = PETSEnsembleTrainer(
         ensemble_size=args.ensemble_size,
         lr=args.lr,
@@ -1527,6 +1899,7 @@ def main() -> None:
         norm_stats=norm_stats,
         init_params_path=init_params_path,
     )
+    _log_startup("Building PETS planner")
     planner = PETSCEMPlanner(
         params=trainer.state.params,
         apply_fn=trainer.state.apply_fn,
@@ -1562,32 +1935,50 @@ def main() -> None:
     stop_requested = False
     try:
         if args.jit_step:
+            _log_startup(
+                "Starting JIT warmup for planner.plan and env.step. "
+                "The first compile can take a while, especially on balanced/full presets."
+            )
             rng, warm_reset_rng, warm_plan_rng = jax.random.split(rng, 3)
             warm_state = env.reset(warm_reset_rng)
             warm_obs = flatten_obs(warm_state.obs, obs_keys)
             warm_rollout_state = build_rollout_reward_state(warm_state.info)
+            _log_startup("Compiling planner.plan")
+            planner_compile_start = time.perf_counter()
             warm_action, _, warm_plan_rng = planner.plan(
                 warm_obs,
                 warm_rollout_state,
                 warm_plan_rng,
             )
+            jax.block_until_ready(warm_action)
+            print(f"Compiled planner.plan in {time.perf_counter() - planner_compile_start:.2f}s")
+            _log_startup("Compiling env.step")
             compile_start = time.perf_counter()
             warm_state = step_fn(warm_state, warm_action)
             jax.block_until_ready(warm_state.reward)
             print(f"Compiled env.step in {time.perf_counter() - compile_start:.2f}s")
+        else:
+            _log_debug(args.debug_prints, "Skipping env.step JIT warmup because --no_jit_step is active.")
 
         for episode_id in range(args.num_episodes):
             planner.reset()
             rng, reset_rng, plan_rng = jax.random.split(rng, 3)
             state = env.reset(reset_rng)
+            _log_startup(
+                f"Starting episode {episode_id + 1}/{args.num_episodes} "
+                f"(max_steps={args.max_steps}, plan_every={plan_every})"
+            )
             if not visualizer.reset_episode(episode_id + 1, state):
                 print("Viewer closed, stopping PETS run.")
                 stop_requested = True
                 break
             force_replan = True
-            episode_return = 0.0
+            episode_return = jnp.asarray(0.0, dtype=jnp.float32)
             step_count = 0
-            last_plan_info = {"best_return": 0.0, "mean_action_std": float(args.init_std)}
+            last_plan_info = {
+                "best_return": jnp.asarray(0.0, dtype=jnp.float32),
+                "mean_action_std": jnp.asarray(args.init_std, dtype=jnp.float32),
+            }
             episode_start_time = time.perf_counter()
 
             for step_id in range(args.max_steps):
@@ -1595,6 +1986,12 @@ def main() -> None:
                 obs_flat = flatten_obs(state.obs, obs_keys)
                 if force_replan or (step_id % plan_every) == 0:
                     rollout_state = build_rollout_reward_state(state.info)
+                    if args.debug_prints and step_id == 0:
+                        _log_debug(
+                            True,
+                            f"Episode {episode_id + 1}: running first planner.plan "
+                            f"(horizon={args.plan_horizon}, pop={args.cem_population}, particles={args.num_particles})"
+                        )
                     action, plan_info, plan_rng = planner.plan(
                         obs_flat,
                         rollout_state,
@@ -1607,21 +2004,17 @@ def main() -> None:
                     plan_info = last_plan_info
                 next_state = step_fn(state, action)
                 next_obs_flat = flatten_obs(next_state.obs, obs_keys)
-                applied_action = np.asarray(
-                    jax.device_get(next_state.info["held_action"]),
-                    dtype=np.float32,
-                ).reshape(ACTION_DIM)
-                reward = float(jax.device_get(next_state.reward))
-                replay.add_transition(
-                    obs=np.asarray(jax.device_get(obs_flat), dtype=np.float32),
-                    action=applied_action,
-                    next_obs=np.asarray(jax.device_get(next_obs_flat), dtype=np.float32),
-                    reward=reward,
+                pending_replay.add_transition(
+                    obs=obs_flat,
+                    action=next_state.info["held_action"],
+                    next_obs=next_obs_flat,
+                    reward=next_state.reward,
                 )
-                episode_return += reward
+                episode_return = episode_return + next_state.reward
                 step_count = step_id + 1
                 global_step += 1
                 state = next_state
+                done = bool(jax.device_get(state.done))
 
                 if not visualizer.sync(state):
                     print("Viewer closed, stopping PETS run.")
@@ -1630,16 +2023,18 @@ def main() -> None:
                     episode_id=episode_id + 1,
                     step_id=step_count,
                     state=state,
+                    done=done,
                     episode_return=episode_return,
                     plan_info=plan_info,
                     action=action,
                 )
 
                 should_retrain = (
-                    replay.online_size >= args.warmup_online_steps
+                    (replay.online_size + pending_replay.size) >= args.warmup_online_steps
                     and (global_step % args.retrain_every == 0)
                 )
                 if should_retrain:
+                    pending_replay.flush_into(replay)
                     train_metrics = trainer.train_updates(
                         replay=replay,
                         batch_size=args.batch_size,
@@ -1672,28 +2067,39 @@ def main() -> None:
                     )
 
                 visualizer.maybe_sleep(step_start_time, during_rollout=True)
-                if stop_requested or bool(jax.device_get(state.done)):
+                if stop_requested or done:
                     break
 
+            pending_replay.flush_into(replay)
             episode_seconds = time.perf_counter() - episode_start_time
-            best_episode_return = max(best_episode_return, episode_return)
+            episode_return_value = float(jax.device_get(episode_return))
+            best_episode_return = max(best_episode_return, episode_return_value)
             done_info = state.info
+            success, terminated, truncated, final_distance, last_plan_best_return = jax.device_get(
+                (
+                    done_info["success"],
+                    done_info["terminated"],
+                    done_info["truncated"],
+                    done_info["distance"],
+                    last_plan_info["best_return"],
+                )
+            )
             episode_record = {
                 "episode": episode_id + 1,
                 "steps": step_count,
-                "return": float(episode_return),
+                "return": episode_return_value,
                 "seconds": float(episode_seconds),
-                "success": bool(jax.device_get(done_info["success"])),
-                "terminated": bool(jax.device_get(done_info["terminated"])),
-                "truncated": bool(jax.device_get(done_info["truncated"])),
-                "final_distance": float(jax.device_get(done_info["distance"])),
-                "last_plan_best_return": float(last_plan_info["best_return"]),
+                "success": bool(success),
+                "terminated": bool(terminated),
+                "truncated": bool(truncated),
+                "final_distance": float(final_distance),
+                "last_plan_best_return": float(last_plan_best_return),
                 "online_transitions": replay.online_size,
             }
             episode_history.append(episode_record)
             print(
                 f"[episode {episode_id + 1}/{args.num_episodes}] "
-                f"return={episode_return:.3f} steps={step_count} "
+                f"return={episode_return_value:.3f} steps={step_count} "
                 f"success={episode_record['success']} "
                 f"final_dist={episode_record['final_distance']:.3f}"
             )
@@ -1706,6 +2112,7 @@ def main() -> None:
     finally:
         visualizer.close()
 
+    pending_replay.flush_into(replay)
     has_untrained_online_data = (
         replay.online_size >= args.warmup_online_steps and global_step > last_retrain_step
     )
