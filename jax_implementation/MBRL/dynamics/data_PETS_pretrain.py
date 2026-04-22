@@ -268,8 +268,8 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Collect PETS pretraining transitions from batched MJX env rollouts."
     )
-    parser.add_argument("--num_envs", type=int, default=256)
-    parser.add_argument("--steps_per_env", type=int, default=1000)
+    parser.add_argument("--num_envs", type=int, default=1024)
+    parser.add_argument("--steps_per_env", type=int, default=10000)
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument(
         "--policy",
@@ -302,7 +302,10 @@ def _build_parser() -> argparse.ArgumentParser:
 def main() -> None:
     args = _build_parser().parse_args()
     cfg = default_config()
+    cfg.markov_obs = True
     applied_overrides = _apply_env_overrides(cfg, args.env_override)
+    if not bool(cfg.get("markov_obs", False)):
+        raise ValueError("PETS pretraining data collection requires markov_obs=true.")
     env = newDrone(config=cfg)
 
     dataset, metadata, elapsed = collect_parallel_rollouts(
@@ -313,8 +316,9 @@ def main() -> None:
         policy=args.policy,
         action_noise_std=args.action_noise_std,
     )
+    metadata["markov_obs"] = bool(cfg.get("markov_obs", False))
     if applied_overrides:
-        metadata["applied_env_overrides"] = applied_overrides.to_list()
+        metadata["applied_env_overrides"] = applied_overrides
 
     dataset_path, meta_path = save_dataset(
         dataset=dataset,

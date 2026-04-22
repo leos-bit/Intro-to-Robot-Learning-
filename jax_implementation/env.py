@@ -70,6 +70,7 @@ def default_config() -> config_dict.ConfigDict:
         episode_length=5000,
         action_repeat=1,
         impl="jax",
+        markov_obs=False,
         nconmax=64,
         njmax=256,
         model_path=_XML_PATH,
@@ -158,7 +159,7 @@ def default_config() -> config_dict.ConfigDict:
         lidar_softmin_tau=0.5,
         lidar_risk_weight=0.5,
         true_obstacle_risk_weight=1.0,
-        drone_clearance_radius=0.25,
+        drone_clearance_radius=0.1,
         obstacle_radius=0.2,
       )
       return sync_config_gain_arr(cfg)
@@ -285,6 +286,7 @@ class newDrone(mjx_env.MjxEnv):
             self.vellim = float(self._config.vellim)
             self.yawrate_lim = float(self._config.yawrate_lim)
             self.action_scale = float(min(max(float(self._config.action_scale), 0.05), 1.0))
+            self.markov_obs = bool(self._config.get("markov_obs", False))
             self.inner_dt = float(self.sim_dt)
             self.outer_dt = float(self.sim_dt * self.outer_decim)
             self._outer_pid_dim = 3
@@ -330,6 +332,8 @@ class newDrone(mjx_env.MjxEnv):
             self._obs_vel_high = jp.array(
                 [self.obs_vel_lim, self.obs_vel_lim, self.obs_vel_lim], dtype=jp.float32
             )
+            self._obs_angvel_low = jp.full((3,), -self.obs_yawrate_lim, dtype=jp.float32)
+            self._obs_angvel_high = jp.full((3,), self.obs_yawrate_lim, dtype=jp.float32)
             self._obs_yaw_low = jp.array([-self.obs_yawrate_lim], dtype=jp.float32)
             self._obs_yaw_high = jp.array([self.obs_yawrate_lim], dtype=jp.float32)
             self._obs_goal_low = jp.array(
@@ -340,6 +344,69 @@ class newDrone(mjx_env.MjxEnv):
             )
             self._action_low = jp.full((4,), -1.0, dtype=jp.float32)
             self._action_high = jp.full((4,), 1.0, dtype=jp.float32)
+            self._held_action_low = self._action_low * self.action_scale
+            self._held_action_high = self._action_high * self.action_scale
+            self._outer_cmd_low = jp.array(
+                [
+                    -self.collective_limit,
+                    -self.max_tilt,
+                    -self.max_tilt,
+                    -self.yawrate_lim,
+                ],
+                dtype=jp.float32,
+            )
+            self._outer_cmd_high = jp.array(
+                [
+                    self.collective_limit,
+                    self.max_tilt,
+                    self.max_tilt,
+                    self.yawrate_lim,
+                ],
+                dtype=jp.float32,
+            )
+            outer_prev_error_limit = jp.full(
+                (3,),
+                self.obs_vel_lim + self.vellim,
+                dtype=jp.float32,
+            )
+            self._outer_pid_state_low = jp.concatenate(
+                [
+                    jp.full((3,), -self.outer_i_limit, dtype=jp.float32),
+                    -outer_prev_error_limit,
+                ],
+                axis=0,
+            )
+            self._outer_pid_state_high = jp.concatenate(
+                [
+                    jp.full((3,), self.outer_i_limit, dtype=jp.float32),
+                    outer_prev_error_limit,
+                ],
+                axis=0,
+            )
+            inner_prev_error_limit = jp.array(
+                [
+                    2.0 * self.max_tilt,
+                    2.0 * self.max_tilt,
+                    self.obs_yawrate_lim + self.yawrate_lim,
+                ],
+                dtype=jp.float32,
+            )
+            self._inner_pid_state_low = jp.concatenate(
+                [
+                    jp.full((3,), -self.inner_i_limit, dtype=jp.float32),
+                    -inner_prev_error_limit,
+                ],
+                axis=0,
+            )
+            self._inner_pid_state_high = jp.concatenate(
+                [
+                    jp.full((3,), self.inner_i_limit, dtype=jp.float32),
+                    inner_prev_error_limit,
+                ],
+                axis=0,
+            )
+            self._controller_update_flags_low = jp.zeros((2,), dtype=jp.float32)
+            self._controller_update_flags_high = jp.ones((2,), dtype=jp.float32)
             self.obstacle_center_z = float(self._config.get("obstacle_center_z", 0.75))
             self.obstacle_spawn_clearance = float(
                 max(0.0, float(self._config.get("obstacle_spawn_clearance", 1.0)))
@@ -537,6 +604,43 @@ class newDrone(mjx_env.MjxEnv):
                 },
 
             }
+            if self.markov_obs:
+                self.obs_spec["agent_angvel"] = {
+                    "low": self._obs_angvel_low,
+                    "high": self._obs_angvel_high,
+                    "shape": (3,),
+                    "dtype": jp.float32,
+                }
+                self.obs_spec["controller_held_action"] = {
+                    "low": self._held_action_low,
+                    "high": self._held_action_high,
+                    "shape": (4,),
+                    "dtype": jp.float32,
+                }
+                self.obs_spec["controller_outer_cmd"] = {
+                    "low": self._outer_cmd_low,
+                    "high": self._outer_cmd_high,
+                    "shape": (4,),
+                    "dtype": jp.float32,
+                }
+                self.obs_spec["controller_outer_pid_state"] = {
+                    "low": self._outer_pid_state_low,
+                    "high": self._outer_pid_state_high,
+                    "shape": (6,),
+                    "dtype": jp.float32,
+                }
+                self.obs_spec["controller_inner_pid_state"] = {
+                    "low": self._inner_pid_state_low,
+                    "high": self._inner_pid_state_high,
+                    "shape": (6,),
+                    "dtype": jp.float32,
+                }
+                self.obs_spec["controller_update_flags"] = {
+                    "low": self._controller_update_flags_low,
+                    "high": self._controller_update_flags_high,
+                    "shape": (2,),
+                    "dtype": jp.float32,
+                }
             self.action_spec = {
                 "low": self._action_low,
                 "high": self._action_high,
@@ -1150,7 +1254,7 @@ class newDrone(mjx_env.MjxEnv):
             0.0,
             float(self.max_active_obstacles),
         )
-        return {
+        obs = {
             "agent_pos_xy": jp.clip(agent_location[0:2], self._obs_xy_low, self._obs_xy_high),
             "agent_pos_z": jp.clip(agent_location[2:3], self._obs_z_low, self._obs_z_high),
             "agent_orientation": agent_orientation,
@@ -1163,6 +1267,76 @@ class newDrone(mjx_env.MjxEnv):
             "obstacle_mask": obstacle_mask,
             "num_active": num_active,
         }
+        if self.markov_obs:
+            agent_angvel = jp.nan_to_num(
+                info["agent_angvel"],
+                nan=0.0,
+                posinf=self.obs_yawrate_lim,
+                neginf=-self.obs_yawrate_lim,
+            ).astype(jp.float32)
+            held_action = jp.nan_to_num(
+                info["held_action"],
+                nan=0.0,
+                posinf=1.0,
+                neginf=-1.0,
+            ).astype(jp.float32)
+            outer_cmd = jp.nan_to_num(
+                info["outer_cmd"],
+                nan=0.0,
+                posinf=self.collective_limit,
+                neginf=-self.collective_limit,
+            ).astype(jp.float32)
+            outer_pid_state = jp.nan_to_num(
+                info["outer_pid_state"],
+                nan=0.0,
+                posinf=self.obs_vel_lim + self.vellim,
+                neginf=-(self.obs_vel_lim + self.vellim),
+            ).astype(jp.float32)
+            inner_pid_state = jp.nan_to_num(
+                info["inner_pid_state"],
+                nan=0.0,
+                posinf=self.obs_yawrate_lim + self.yawrate_lim,
+                neginf=-(self.obs_yawrate_lim + self.yawrate_lim),
+            ).astype(jp.float32)
+            sim_step = jp.asarray(info["sim_step"], dtype=jp.int32)
+            controller_update_flags = jp.array(
+                [
+                    jp.asarray((sim_step % self.policy_decim) == 0, dtype=jp.float32),
+                    jp.asarray((sim_step % self.outer_decim) == 0, dtype=jp.float32),
+                ],
+                dtype=jp.float32,
+            )
+            obs["agent_angvel"] = jp.clip(
+                agent_angvel,
+                self._obs_angvel_low,
+                self._obs_angvel_high,
+            )
+            obs["controller_held_action"] = jp.clip(
+                held_action,
+                self._held_action_low,
+                self._held_action_high,
+            )
+            obs["controller_outer_cmd"] = jp.clip(
+                outer_cmd,
+                self._outer_cmd_low,
+                self._outer_cmd_high,
+            )
+            obs["controller_outer_pid_state"] = jp.clip(
+                outer_pid_state,
+                self._outer_pid_state_low,
+                self._outer_pid_state_high,
+            )
+            obs["controller_inner_pid_state"] = jp.clip(
+                inner_pid_state,
+                self._inner_pid_state_low,
+                self._inner_pid_state_high,
+            )
+            obs["controller_update_flags"] = jp.clip(
+                controller_update_flags,
+                self._controller_update_flags_low,
+                self._controller_update_flags_high,
+            )
+        return obs
 
     def _pack_pid_state(self, integral: jax.Array, prev_error: jax.Array) -> jax.Array:
         return jp.concatenate(

@@ -196,12 +196,26 @@ def build_flat_obs_bounds(env: newDrone, obs_keys: tuple[str, ...]) -> tuple[np.
 
 def load_norm_stats(path: Path) -> dict[str, np.ndarray]:
     data = np.load(path)
-    return {
+    norm_stats = {
         "x_mean": np.asarray(data["x_mean"], dtype=np.float32),
         "x_std": np.asarray(data["x_std"], dtype=np.float32),
         "y_mean": np.asarray(data["y_mean"], dtype=np.float32),
         "y_std": np.asarray(data["y_std"], dtype=np.float32),
     }
+    expected_x_dim = OBS_DIM + ACTION_DIM
+    expected_y_dim = OBS_DIM + 1
+    if (
+        norm_stats["x_mean"].shape != (expected_x_dim,)
+        or norm_stats["x_std"].shape != (expected_x_dim,)
+        or norm_stats["y_mean"].shape != (expected_y_dim,)
+        or norm_stats["y_std"].shape != (expected_y_dim,)
+    ):
+        raise ValueError(
+            f"Normalization stats at {path} are incompatible with Markov PETS "
+            f"(expected x_dim={expected_x_dim}, y_dim={expected_y_dim}). "
+            "Regenerate the PETS dataset and retrain PETS_Pretrain.py."
+        )
+    return norm_stats
 
 
 def flatten_transition_block(
@@ -772,7 +786,14 @@ class PETSEnsembleTrainer:
         dummy_x = jnp.zeros((self.ensemble_size, 1, OBS_DIM + ACTION_DIM), dtype=jnp.float32)
         params_template = self.model.init(jax.random.PRNGKey(seed), dummy_x)["params"]
         if init_params_path is not None:
-            params = serialization.from_bytes(params_template, init_params_path.read_bytes())
+            try:
+                params = serialization.from_bytes(params_template, init_params_path.read_bytes())
+            except Exception as exc:
+                raise ValueError(
+                    f"Checkpoint {init_params_path} is incompatible with the current Markov PETS "
+                    f"state dimension (obs_dim={OBS_DIM}). Retrain PETS_Pretrain.py to produce "
+                    "new ensemble checkpoints."
+                ) from exc
         else:
             params = params_template
         self.state = train_state.TrainState.create(
@@ -1689,7 +1710,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--val_batch_size", type=int, default=8192)
     parser.add_argument("--val_batches", type=int, default=32)
     parser.add_argument("--num_episodes", type=int, default=10)
-    parser.add_argument("--max_steps", type=int, default=5000)
+    parser.add_argument("--max_steps", type=int, default=15000)
     parser.add_argument("--plan_horizon", type=int, default=300)
     parser.add_argument(
         "--plan_every",
@@ -1797,7 +1818,10 @@ def main() -> None:
     online_data_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = default_config()
+    cfg.markov_obs = True
     env_overrides = _apply_env_overrides(cfg, args.env_override)
+    if not bool(cfg.get("markov_obs", False)):
+        raise ValueError("PETS_MPC requires markov_obs=true so the learned state is Markov.")
     env = newDrone(config=cfg)
     obs_keys = tuple(env.obs_spec.keys())
     obs_low, obs_high = build_flat_obs_bounds(env, obs_keys)

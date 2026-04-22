@@ -11,7 +11,8 @@ from flax import serialization
 from flax.training import train_state
 import optax
 
-OBS_DIM = 96
+BASE_OBS_DIM = 96
+OBS_DIM = 121
 ACTION_DIM = 4
 MAX_OBSTACLES = 15
 TARGET_DIM = OBS_DIM + 1
@@ -26,6 +27,8 @@ LOGVAR_LOWER_BOUND = -10.0
 LOGVAR_UPPER_BOUND = 0.5
 LOGVAR_BOUND_EPS = 1e-6
 DYNAMICS_TARGET_DIM = OBS_DIM
+NUM_ACTIVE_SLICE = slice(95, 96)
+MARKOV_STATE_SLICE = slice(BASE_OBS_DIM, OBS_DIM)
 
 
 class MLP(nn.Module):
@@ -149,7 +152,8 @@ def split_observation(obs):
         "lidar": obs[..., 17:35],
         "obstacle_rel": obstacle_rel,
         "obstacle_mask": obstacle_mask,
-        "num_active": obs[..., 95:96],
+        "num_active": obs[..., NUM_ACTIVE_SLICE],
+        "markov_state": obs[..., MARKOV_STATE_SLICE],
     }
 
 
@@ -176,8 +180,9 @@ class Dynamics_Model(nn.Module):
             obs_parts["obstacle_mask"],
             obs_parts["num_active"],
         )
+        markov_feat = MLP((64, 64))(obs_parts["markov_state"])
 
-        h = jnp.concatenate([core_feat, lidar_feat, obstacle_feat, action], axis=-1)
+        h = jnp.concatenate([core_feat, lidar_feat, obstacle_feat, markov_feat, action], axis=-1)
         h = MLP(self.trunk_widths)(h)
 
         mean = nn.Dense(self.target_dim, name="mean_head")(h)
@@ -213,15 +218,28 @@ def load_arrays(data_path: str | Path) -> dict[str, np.ndarray]:
             raise KeyError(
                 f"Dataset {data_path} must contain either 'applied_action' or 'action'."
             )
+        obs = np.asarray(data["obs"], dtype=np.float32)
+        next_obs = np.asarray(data["next_obs"], dtype=np.float32)
+        action = np.asarray(data[action_key], dtype=np.float32)
+        if obs.shape[-1] != OBS_DIM or next_obs.shape[-1] != OBS_DIM:
+            raise ValueError(
+                f"Dataset {data_path} has obs_dim={obs.shape[-1]} / next_obs_dim={next_obs.shape[-1]}, "
+                f"but PETS now expects Markov observations with dim={OBS_DIM}. "
+                "Regenerate the PETS dataset with data_PETS_pretrain.py and retrain PETS_Pretrain.py."
+            )
+        if action.shape[-1] != ACTION_DIM:
+            raise ValueError(
+                f"Dataset {data_path} has action_dim={action.shape[-1]}, expected {ACTION_DIM}."
+            )
         reward = (
             np.asarray(data["reward"], dtype=np.float32)
             if "reward" in data.files
-            else np.zeros(data["obs"].shape[:2], dtype=np.float32)
+            else np.zeros(obs.shape[:2], dtype=np.float32)
         )
         return {
-            "obs": np.asarray(data["obs"], dtype=np.float32),
-            "applied_action": np.asarray(data[action_key], dtype=np.float32),
-            "next_obs": np.asarray(data["next_obs"], dtype=np.float32),
+            "obs": obs,
+            "applied_action": action,
+            "next_obs": next_obs,
             "reward": reward,
         }
 
