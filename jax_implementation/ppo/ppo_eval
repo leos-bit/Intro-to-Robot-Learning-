@@ -13,7 +13,7 @@ import sys
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
-from jax_implementation.env import newDrone, default_config
+from jax_implementation.env import newDrone, default_config, sync_config_gain_arr
 import mujoco
 import mujoco.viewer
 from mujoco_playground._src import mjx_env
@@ -60,7 +60,7 @@ def _load_env_cfg_from_checkpoint(ckpt: Path):
                 f"{env_cfg.action_repeat} vs {ppo_action_repeat}"
             )
 
-    return env_cfg
+    return sync_config_gain_arr(env_cfg)
 
 
 def load_policy(ckpt: Path):
