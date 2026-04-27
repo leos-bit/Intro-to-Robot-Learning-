@@ -1,7 +1,12 @@
 import argparse
 import json
+import os
 from functools import partial
 from pathlib import Path
+
+# Keep JAX from reserving most GPU memory at process start. Users can still
+# override this from the shell when they want the default preallocating allocator.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import flax.linen as nn
 import jax
@@ -163,7 +168,7 @@ class Dynamics_Model(nn.Module):
     lidar_max_dist: float = 6.0
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, det: bool = True):
         obs, action = split_model_input(x)
         obs_parts = split_observation(obs)
 
@@ -184,7 +189,7 @@ class Dynamics_Model(nn.Module):
 
         h = jnp.concatenate([core_feat, lidar_feat, obstacle_feat, markov_feat, action], axis=-1)
         h = MLP(self.trunk_widths)(h)
-
+        h = nn.Dropout(0.0)(h, deterministic=det)
         mean = nn.Dense(self.target_dim, name="mean_head")(h)
         raw_logvar = nn.Dense(self.target_dim, name="logvar_head")(h)
 
@@ -456,7 +461,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--train_ratio", type=float, default=0.9)
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--ensemble_size", type=int, default=8)
+    parser.add_argument("--ensemble_size", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=4096)
     parser.add_argument("--steps_per_epoch", type=int, default=1000)
     parser.add_argument("--epochs", type=int, default=100)
@@ -475,16 +480,16 @@ class EnsembleDynamics(nn.Module):
     ensemble_size: int = 8
 
     @nn.compact
-    def __call__(self, x):
+    def __call__(self, x, det: bool = True):
         VmappedModel = nn.vmap(
             Dynamics_Model,
-            variable_axes={"params": 0},  
-            split_rngs={"params": True},  
-            in_axes=0,                     
+            variable_axes={"params": 0},
+            split_rngs={"params": True, "dropout": True},
+            in_axes=(0, None),
             out_axes=0,
             axis_size=self.ensemble_size,
         )
-        return VmappedModel()(x)
+        return VmappedModel()(x, det)
 
 
 def _logvar_reg(params) -> jnp.ndarray:
@@ -495,9 +500,16 @@ def _logvar_reg(params) -> jnp.ndarray:
 
 
 @jax.jit
-def train_step(state, batch_x, batch_y, y_std):
+def train_step(state, batch_x, batch_y, y_std, rng):
+    rng, dropout_rng = jax.random.split(rng)
+
     def loss_fn(params):
-        mean, logvar = state.apply_fn({"params": params}, batch_x)  # (E,B,97), (E,B,97)
+        mean, logvar = state.apply_fn(
+            {"params": params},
+            batch_x,
+            det=False,
+            rngs={"dropout": dropout_rng},
+        )  # (E,B,97), (E,B,97)
         dyn_mean = mean[..., :DYNAMICS_TARGET_DIM]
         dyn_logvar = logvar[..., :DYNAMICS_TARGET_DIM]
         dyn_target = batch_y[..., :DYNAMICS_TARGET_DIM]
@@ -529,12 +541,12 @@ def train_step(state, batch_x, batch_y, y_std):
 
     (_, metrics), grads = jax.value_and_grad(loss_fn, has_aux=True)(state.params)
     state = state.apply_gradients(grads=grads)
-    return state, metrics
+    return state, metrics, rng
 
 
 @partial(jax.jit, static_argnames=("apply_fn",))
 def eval_step(params, apply_fn, batch_x, batch_y, y_std):
-    mean, logvar = apply_fn({"params": params}, batch_x)
+    mean, logvar = apply_fn({"params": params}, batch_x, det = True)
     dyn_mean = mean[..., :DYNAMICS_TARGET_DIM]
     dyn_logvar = logvar[..., :DYNAMICS_TARGET_DIM]
     dyn_target = batch_y[..., :DYNAMICS_TARGET_DIM]
@@ -632,14 +644,22 @@ if __name__ == "__main__":
         raise ValueError("--eval_every must be positive.")
     
     dummy_x = jnp.zeros((E, 1, obs_dim + action_dim), dtype=jnp.float32)
-    params = model.init(jax.random.PRNGKey(0), dummy_x)["params"]
+    rng = jax.random.PRNGKey(args.seed)
+    rng, init_rng, dropout_init_rng = jax.random.split(rng, 3)
 
+    params = model.init(
+        {"params": init_rng, "dropout": dropout_init_rng},
+        dummy_x,
+        det=True,
+    )["params"]
+
+    lr_scheduler = optax.cosine_decay_schedule(init_value=args.lr, decay_steps=70, alpha=0.0001)
     state = train_state.TrainState.create(
         apply_fn=model.apply,
         params=params,
         tx=optax.chain(
             optax.clip_by_global_norm(GRAD_CLIP_NORM),
-            optax.adam(args.lr),
+            optax.adamw(lr_scheduler, weight_decay=1E-6, mask=lambda p: jax.tree.map(lambda x: x.ndim > 1, p))
         ),
     )
     np.save(save_dir / "train_idx.npy", train_idx)
@@ -664,7 +684,7 @@ if __name__ == "__main__":
             batch_x = jnp.asarray(np.stack([bx for bx, _ in member_batches], axis=0), dtype=jnp.float32)
             batch_y = jnp.asarray(np.stack([by for _, by in member_batches], axis=0), dtype=jnp.float32)
 
-            state, metrics = train_step(state, batch_x, batch_y, y_std)
+            state, metrics, rng = train_step(state, batch_x, batch_y, y_std, rng)
             metrics = jax.device_get(metrics)
             assert_finite_metrics(metrics, f"train epoch={epoch} step={num_train_batches + 1}")
             train_loss_sum += float(metrics["loss"])

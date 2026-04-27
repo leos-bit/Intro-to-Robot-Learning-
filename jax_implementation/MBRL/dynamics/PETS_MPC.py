@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-# os.environ.setdefault("JAX_PLATFORMS", "cpu")
+# Keep JAX from reserving most GPU memory at process start. Users can still
+# override this from the shell when they want the default preallocating allocator.
+os.environ.setdefault("XLA_PYTHON_CLIENT_PREALLOCATE", "false")
 
 import jax
 import jax.numpy as jnp
@@ -149,7 +151,99 @@ class ReplayFrame:
 @dataclass
 class EpisodeReplay:
     episode_id: int
-    frames: list[ReplayFrame]
+    directory: Path
+    frame_count: int
+
+
+class DiskEpisodeRecorder:
+    def __init__(
+        self,
+        *,
+        episode_id: int,
+        replay_dir: Path,
+        max_frames: int,
+        env: newDrone,
+    ) -> None:
+        self.episode_id = int(episode_id)
+        self.directory = replay_dir / f"episode_{self.episode_id:04d}"
+        self.directory.mkdir(parents=True, exist_ok=True)
+        self.max_frames = int(max_frames)
+        self.frame_count = 0
+        self.env = env
+        model = env.mj_model
+        self.qpos = np.lib.format.open_memmap(
+            self.directory / "qpos.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(self.max_frames, model.nq),
+        )
+        self.qvel = np.lib.format.open_memmap(
+            self.directory / "qvel.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(self.max_frames, model.nv),
+        )
+        self.ctrl = np.lib.format.open_memmap(
+            self.directory / "ctrl.npy",
+            mode="w+",
+            dtype=np.float32,
+            shape=(self.max_frames, model.nu),
+        )
+        self.mocap_pos = None
+        self.mocap_quat = None
+        if model.nmocap > 0:
+            self.mocap_pos = np.lib.format.open_memmap(
+                self.directory / "mocap_pos.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(self.max_frames, model.nmocap, 3),
+            )
+            self.mocap_quat = np.lib.format.open_memmap(
+                self.directory / "mocap_quat.npy",
+                mode="w+",
+                dtype=np.float32,
+                shape=(self.max_frames, model.nmocap, 4),
+            )
+
+    def record(self, frame: ReplayFrame) -> None:
+        if self.frame_count >= self.max_frames:
+            raise RuntimeError(
+                f"Replay recorder for episode {self.episode_id} exceeded "
+                f"its max_frames={self.max_frames}. Increase --max_steps or disable replay."
+            )
+        idx = self.frame_count
+        self.qpos[idx] = frame.qpos
+        self.qvel[idx] = frame.qvel
+        self.ctrl[idx] = frame.ctrl
+        if self.mocap_pos is not None and frame.mocap_pos is not None:
+            self.mocap_pos[idx] = frame.mocap_pos
+        if self.mocap_quat is not None and frame.mocap_quat is not None:
+            self.mocap_quat[idx] = frame.mocap_quat
+        self.frame_count += 1
+
+    def finish(self) -> EpisodeReplay:
+        self.qpos.flush()
+        self.qvel.flush()
+        self.ctrl.flush()
+        if self.mocap_pos is not None:
+            self.mocap_pos.flush()
+        if self.mocap_quat is not None:
+            self.mocap_quat.flush()
+        metadata = {
+            "episode_id": self.episode_id,
+            "frame_count": self.frame_count,
+            "max_frames": self.max_frames,
+            "has_mocap": self.mocap_pos is not None and self.mocap_quat is not None,
+        }
+        (self.directory / "metadata.json").write_text(
+            json.dumps(metadata, indent=2) + "\n",
+            encoding="utf-8",
+        )
+        return EpisodeReplay(
+            episode_id=self.episode_id,
+            directory=self.directory,
+            frame_count=self.frame_count,
+        )
 
 
 def _parse_override(raw_value: str) -> Any:
@@ -639,6 +733,10 @@ class OnlineReplayBuffer:
                 np.float32, copy=False
             ),
         }
+        self._online_obs_parts = [self._online_cache["obs"]]
+        self._online_action_parts = [self._online_cache["action"]]
+        self._online_next_obs_parts = [self._online_cache["next_obs"]]
+        self._online_reward_parts = [self._online_cache["reward"]]
         return self._online_cache
 
     def sample_transitions(self, indices: np.ndarray) -> dict[str, np.ndarray]:
@@ -729,33 +827,38 @@ class PendingReplayBuffer:
         next_obs: jax.Array,
         reward: jax.Array,
     ) -> None:
-        self._obs_parts.append(jnp.asarray(obs, dtype=jnp.float32).reshape(1, OBS_DIM))
-        self._action_parts.append(jnp.asarray(action, dtype=jnp.float32).reshape(1, ACTION_DIM))
-        self._next_obs_parts.append(jnp.asarray(next_obs, dtype=jnp.float32).reshape(1, OBS_DIM))
-        self._reward_parts.append(jnp.asarray(reward, dtype=jnp.float32).reshape(1))
+        obs_host, action_host, next_obs_host, reward_host = jax.device_get(
+            (obs, action, next_obs, reward)
+        )
+        self._obs_parts.append(
+            np.asarray(obs_host, dtype=np.float32).reshape(1, OBS_DIM).copy()
+        )
+        self._action_parts.append(
+            np.asarray(action_host, dtype=np.float32).reshape(1, ACTION_DIM).copy()
+        )
+        self._next_obs_parts.append(
+            np.asarray(next_obs_host, dtype=np.float32).reshape(1, OBS_DIM).copy()
+        )
+        self._reward_parts.append(np.asarray(reward_host, dtype=np.float32).reshape(1).copy())
         self._size += 1
 
     def flush_into(self, replay: OnlineReplayBuffer) -> int:
         if self._size <= 0:
             return 0
-        obs_block, action_block, next_obs_block, reward_block = jax.device_get(
-            (
-                jnp.concatenate(self._obs_parts, axis=0),
-                jnp.concatenate(self._action_parts, axis=0),
-                jnp.concatenate(self._next_obs_parts, axis=0),
-                jnp.concatenate(self._reward_parts, axis=0),
-            )
-        )
+        obs_block = np.concatenate(self._obs_parts, axis=0)
+        action_block = np.concatenate(self._action_parts, axis=0)
+        next_obs_block = np.concatenate(self._next_obs_parts, axis=0)
+        reward_block = np.concatenate(self._reward_parts, axis=0)
         replay.add_transition_block(obs_block, action_block, next_obs_block, reward_block)
         flushed = self._size
         self.clear()
         return flushed
 
     def clear(self) -> None:
-        self._obs_parts: list[jax.Array] = []
-        self._action_parts: list[jax.Array] = []
-        self._next_obs_parts: list[jax.Array] = []
-        self._reward_parts: list[jax.Array] = []
+        self._obs_parts: list[np.ndarray] = []
+        self._action_parts: list[np.ndarray] = []
+        self._next_obs_parts: list[np.ndarray] = []
+        self._reward_parts: list[np.ndarray] = []
         self._size = 0
 
 
@@ -804,6 +907,7 @@ class PETSEnsembleTrainer:
                 optax.adam(lr),
             ),
         )
+        self.train_rng = jax.random.PRNGKey(seed)
         self.rng = np.random.default_rng(seed)
 
     def _build_xy(self, transitions: dict[str, np.ndarray]) -> tuple[np.ndarray, np.ndarray]:
@@ -853,7 +957,13 @@ class PETSEnsembleTrainer:
                 np.stack([by for _, by in member_batches], axis=0),
                 dtype=jnp.float32,
             )
-            self.state, metrics = train_step(self.state, batch_x, batch_y, self.y_std_jax)
+            self.state, metrics, self.train_rng = train_step(
+                self.state,
+                batch_x,
+                batch_y,
+                self.y_std_jax,
+                self.train_rng,
+            )
             metrics = jax.device_get(metrics)
             assert_finite_metrics(metrics, f"online train step={step_id + 1}")
             stats["loss"] += float(metrics["loss"])
@@ -1165,15 +1275,22 @@ def build_rollout_eval_fn(
         model_ids_flat: jax.Array,
     ) -> tuple[jax.Array, jax.Array]:
         ensemble_params = params["VmapDynamics_Model_0"]
-
-        def _apply_one(single_x: jax.Array, model_id: jax.Array):
+        member_means = []
+        member_logvars = []
+        for member_idx in range(ensemble_size):
             member_params = jax.tree_util.tree_map(
-                lambda leaf: leaf[model_id],
+                lambda leaf, idx=member_idx: leaf[idx],
                 ensemble_params,
             )
-            return single_model.apply({"params": member_params}, single_x)
+            mean, logvar = single_model.apply({"params": member_params}, model_x, det=True)
+            member_means.append(mean)
+            member_logvars.append(logvar)
 
-        return jax.vmap(_apply_one)(model_x, model_ids_flat)
+        means = jnp.stack(member_means, axis=0)
+        logvars = jnp.stack(member_logvars, axis=0)
+        particle_idx = jnp.arange(model_x.shape[0], dtype=jnp.int32)
+        model_ids_flat = model_ids_flat.astype(jnp.int32)
+        return means[model_ids_flat, particle_idx], logvars[model_ids_flat, particle_idx]
 
     @jax.jit
     def _evaluate(
@@ -1528,17 +1645,23 @@ class PETSVisualizer:
         render_completed_run: bool,
         real_time: bool,
         print_every: int,
+        replay_dir: Path,
+        max_steps: int,
     ) -> None:
         self.env = env
         self.render_live = bool(render_live)
         self.render_completed_run = bool(render_completed_run)
         self.real_time = bool(real_time)
         self.print_every = int(print_every)
+        self.replay_dir = replay_dir
+        self.max_recorded_frames = int(max_steps) + 1
         self.viewer = None
         self.viewer_data = None
         self.ctrl_dt = float(getattr(env, "_ctrl_dt", 0.0))
-        self.current_episode: EpisodeReplay | None = None
+        self.current_recorder: DiskEpisodeRecorder | None = None
         self.completed_episodes: list[EpisodeReplay] = []
+        if self.render_completed_run:
+            self.replay_dir.mkdir(parents=True, exist_ok=True)
 
     def _capture_frame(self, state) -> ReplayFrame:
         data = state.data
@@ -1576,12 +1699,15 @@ class PETSVisualizer:
 
     def reset_episode(self, episode_id: int, state) -> bool:
         if self.render_completed_run:
-            self.current_episode = EpisodeReplay(
+            self.current_recorder = DiskEpisodeRecorder(
                 episode_id=int(episode_id),
-                frames=[self._capture_frame(state)],
+                replay_dir=self.replay_dir,
+                max_frames=self.max_recorded_frames,
+                env=self.env,
             )
+            self.current_recorder.record(self._capture_frame(state))
         else:
-            self.current_episode = None
+            self.current_recorder = None
         if not self.render_live:
             return True
         self._ensure_viewer()
@@ -1590,8 +1716,8 @@ class PETSVisualizer:
         return self.is_running()
 
     def sync(self, state) -> bool:
-        if self.current_episode is not None:
-            self.current_episode.frames.append(self._capture_frame(state))
+        if self.current_recorder is not None:
+            self.current_recorder.record(self._capture_frame(state))
         if not self.render_live or self.viewer is None or self.viewer_data is None:
             return True
         _sync_viewer_data(self.env, self.viewer_data, state)
@@ -1643,10 +1769,30 @@ class PETSVisualizer:
         time.sleep(max(self.ctrl_dt - elapsed, 0.0))
 
     def finish_episode(self) -> None:
-        if self.current_episode is None:
+        if self.current_recorder is None:
             return
-        self.completed_episodes.append(self.current_episode)
-        self.current_episode = None
+        self.completed_episodes.append(self.current_recorder.finish())
+        self.current_recorder = None
+
+    def _iter_replay_frames(self, episode: EpisodeReplay):
+        qpos = np.load(episode.directory / "qpos.npy", mmap_mode="r")
+        qvel = np.load(episode.directory / "qvel.npy", mmap_mode="r")
+        ctrl = np.load(episode.directory / "ctrl.npy", mmap_mode="r")
+        mocap_pos = None
+        mocap_quat = None
+        mocap_pos_path = episode.directory / "mocap_pos.npy"
+        mocap_quat_path = episode.directory / "mocap_quat.npy"
+        if mocap_pos_path.exists() and mocap_quat_path.exists():
+            mocap_pos = np.load(mocap_pos_path, mmap_mode="r")
+            mocap_quat = np.load(mocap_quat_path, mmap_mode="r")
+        for idx in range(episode.frame_count):
+            yield ReplayFrame(
+                qpos=qpos[idx],
+                qvel=qvel[idx],
+                ctrl=ctrl[idx],
+                mocap_pos=None if mocap_pos is None else mocap_pos[idx],
+                mocap_quat=None if mocap_quat is None else mocap_quat[idx],
+            )
 
     def replay_completed_episodes(self) -> None:
         if not self.render_completed_run or not self.completed_episodes:
@@ -1655,13 +1801,14 @@ class PETSVisualizer:
             f"[replay] Rendering {len(self.completed_episodes)} completed episode(s) after rollout."
         )
         for replay_idx, episode in enumerate(self.completed_episodes, start=1):
-            if not episode.frames:
+            if episode.frame_count <= 0:
                 continue
             print(
                 f"[replay {replay_idx}/{len(self.completed_episodes)}] "
-                f"episode={episode.episode_id} frames={len(episode.frames)}"
+                f"episode={episode.episode_id} frames={episode.frame_count} "
+                f"path={episode.directory}"
             )
-            for frame in episode.frames:
+            for frame in self._iter_replay_frames(episode):
                 if not self.is_running():
                     print("Viewer closed during replay.")
                     return
@@ -1671,6 +1818,9 @@ class PETSVisualizer:
                 self.maybe_sleep(frame_start_time, during_rollout=False)
 
     def close(self) -> None:
+        if self.current_recorder is not None:
+            self.completed_episodes.append(self.current_recorder.finish())
+            self.current_recorder = None
         if self.viewer is not None:
             self.viewer.close()
             self.viewer = None
@@ -1705,9 +1855,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Fraction of each online update batch drawn from post-rollout data.",
     )
     parser.add_argument("--retrain_updates", type=int, default=250)
-    parser.add_argument("--retrain_every", type=int, default=250)
+    parser.add_argument("--retrain_every", type=int, default=1000)
     parser.add_argument("--warmup_online_steps", type=int, default=250)
-    parser.add_argument("--val_batch_size", type=int, default=8192)
+    parser.add_argument("--val_batch_size", type=int, default=4096)
     parser.add_argument("--val_batches", type=int, default=32)
     parser.add_argument("--num_episodes", type=int, default=10)
     parser.add_argument("--max_steps", type=int, default=15000)
@@ -1859,6 +2009,8 @@ def main() -> None:
         render_completed_run=args.render_completed_run,
         real_time=args.real_time,
         print_every=args.print_every,
+        replay_dir=save_dir / "replay_frames",
+        max_steps=args.max_steps,
     )
 
     _log_startup(f"Loading dataset from {args.data_path}")
@@ -2191,6 +2343,7 @@ def main() -> None:
         "planner_reward_mode": "analytic_env_shaping",
         "online_batch_fraction": float(args.online_batch_fraction),
         "online_data_path": str(replay_path),
+        "replay_frame_dir": str(save_dir / "replay_frames") if args.render_completed_run else None,
         "env_overrides": env_overrides,
         "global_steps": int(global_step),
         "online_transitions": int(replay.online_size),
