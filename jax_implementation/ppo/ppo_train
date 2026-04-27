@@ -22,7 +22,6 @@ from ml_collections import config_dict
 from mujoco_playground import wrapper
 from mujoco_playground._src import mjx_env
 import numpy as np
-import rscope
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
@@ -429,6 +428,26 @@ def _checkpoint_rank(metrics: dict[str, Any]) -> tuple[float, float, float]:
     )
 
 
+def _metrics_record(num_steps: int, metrics: dict[str, Any]) -> dict[str, Any]:
+    """Convert Brax callback metrics into JSONL-safe scalar records."""
+    record: dict[str, Any] = {"num_steps": int(num_steps)}
+    for key, value in metrics.items():
+        scalar = _safe_float_scalar(value)
+        if scalar is not None:
+            record[str(key)] = scalar
+            continue
+        try:
+            arr = np.asarray(value)
+            if arr.shape == ():
+                scalar = _safe_float_scalar(arr.item())
+                record[str(key)] = scalar if scalar is not None else str(arr.item())
+            else:
+                record[str(key)] = arr.tolist()
+        except Exception:
+            record[str(key)] = str(value)
+    return record
+
+
 def _save_best_checkpoint(
     ckpt_dir: Path,
     step: int,
@@ -663,6 +682,9 @@ def train(args: argparse.Namespace):
         json.dump(env_cfg_json, fp, indent=2)
     with (logdir / "ppo_config.json").open("w", encoding="utf-8") as fp:
         json.dump(ppo_cfg_json, fp, indent=2)
+    metrics_path = logdir / "metrics.jsonl"
+    latest_metrics_path = logdir / "latest_metrics.json"
+    metrics_path.write_text("", encoding="utf-8")
 
     # SB3-style header
     print("=" * 60)
@@ -807,6 +829,11 @@ def train(args: argparse.Namespace):
                     )
         else:
             logger.log_train(num_steps, metrics)
+
+        record = _metrics_record(int(num_steps), metrics)
+        with metrics_path.open("a", encoding="utf-8") as fp:
+            fp.write(json.dumps(record) + "\n")
+        latest_metrics_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
 
         if tb_writer is not None:
             try:

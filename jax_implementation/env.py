@@ -63,6 +63,9 @@ def default_config() -> config_dict.ConfigDict:
         w_energy=0.01,
         w_smooth=0.02,
         w_speed=0.005,
+        wind_enabled=False,
+        wind_max_accel=0.0,
+        wind_z_scale=0.0,
         r_collision=10.0,
         r_goal=500.0,
         termination_penalty=8.0,
@@ -128,7 +131,7 @@ def default_config() -> config_dict.ConfigDict:
         lidar_softmin_tau=0.5,
         lidar_risk_weight=0.5,
         true_obstacle_risk_weight=1.0,
-        drone_clearance_radius=0.25,
+        drone_clearance_radius=0.20,
         obstacle_radius=0.2,
       )
       cfg.gain_arr = jp.array([
@@ -196,6 +199,9 @@ class newDrone(mjx_env.MjxEnv):
             self.w_energy = float(max(0.0, float(self._config.w_energy)))
             self.w_smooth = float(max(0.0, float(self._config.w_smooth)))
             self.w_speed = float(max(0.0, float(self._config.w_speed)))
+            self.wind_enabled = bool(self._config.get("wind_enabled", False))
+            self.wind_max_accel = float(max(0.0, float(self._config.get("wind_max_accel", 0.0))))
+            self.wind_z_scale = float(max(0.0, float(self._config.get("wind_z_scale", 0.0))))
             self.r_collision = float(max(0.0, float(self._config.r_collision)))
             self.r_goal = float(max(0.0, float(self._config.r_goal)))
             self.termination_penalty = float(max(0.0, float(self._config.termination_penalty)))
@@ -825,7 +831,7 @@ class newDrone(mjx_env.MjxEnv):
             "initial_distance": initial_distance,
         }
     def reset(self, rng: jax.Array) -> mjx_env.State:
-        rng, spawn_rng, obstacle_rng, target_rng = jax.random.split(rng, 4)
+        rng, spawn_rng, obstacle_rng, target_rng, wind_rng = jax.random.split(rng, 5)
         sx, sy, sz = jax.random.split(spawn_rng, 3)
         z_span = max(self.zlim - self.spawn_z_min, 0.0)
         spawn_z = jax.random.uniform(
@@ -890,6 +896,7 @@ class newDrone(mjx_env.MjxEnv):
             obstacle_positions,
             obstacle_mask,
         )
+        wind_accel = self._sample_wind(wind_rng)
 
         info = {
             "rng": rng,
@@ -900,6 +907,7 @@ class newDrone(mjx_env.MjxEnv):
             "agent_yawrate": agent_yawrate,
             "target": target,
             "prev_action": jp.zeros((4,), dtype=jp.float32),
+            "wind_accel": wind_accel,
             "held_action": jp.zeros((4,), dtype=jp.float32),
             "outer_cmd": jp.zeros((4,), dtype=jp.float32),
             "last_motor_cmd": self.hover_ctrl.astype(jp.float32),
@@ -947,6 +955,7 @@ class newDrone(mjx_env.MjxEnv):
             "terminated": jp.array(False),
             "truncated": jp.array(False),
             "reward": jp.array(0.0, dtype=jp.float32),
+            "wind_accel_norm": _safe_l2_norm(wind_accel),
             
         }
         metrics = self._init_step_metrics(initial_target_distance, initial_target_distance)
@@ -1004,6 +1013,7 @@ class newDrone(mjx_env.MjxEnv):
             "terminated": zero,
             "truncated": zero,
             "reward": zero,
+            "wind_accel_norm": zero,
         }
 
     def _get_obs(self, info: dict[str, jax.Array]):
@@ -1355,9 +1365,38 @@ class newDrone(mjx_env.MjxEnv):
         thrust = jp.clip(thrust, self.motor_low, self.motor_high)
         return thrust, self._pack_pid_state(integral, err)
 
-    def _physics_step(self, data: mjx.Data, motor_cmd: jax.Array) -> mjx.Data:
+    def _sample_wind(self, rng: jax.Array) -> jax.Array:
+        if (not self.wind_enabled) or self.wind_max_accel <= 0.0:
+            return jp.zeros((3,), dtype=jp.float32)
+        dir_rng, mag_rng, z_rng = jax.random.split(rng, 3)
+        xy = jax.random.normal(dir_rng, shape=(2,), dtype=jp.float32)
+        xy = xy / jp.maximum(_safe_l2_norm(xy), 1e-6)
+        mag = jax.random.uniform(
+            mag_rng,
+            shape=(),
+            minval=0.0,
+            maxval=jp.asarray(self.wind_max_accel, dtype=jp.float32),
+        )
+        z = jax.random.uniform(
+            z_rng,
+            shape=(),
+            minval=-jp.asarray(self.wind_z_scale, dtype=jp.float32),
+            maxval=jp.asarray(self.wind_z_scale, dtype=jp.float32),
+        ) * mag
+        return jp.array([xy[0] * mag, xy[1] * mag, z], dtype=jp.float32)
+
+    def _apply_wind(self, data: mjx.Data, wind_accel: jax.Array) -> mjx.Data:
+        if (not self.wind_enabled) or self.wind_max_accel <= 0.0:
+            return data
+        wind_accel = jp.asarray(wind_accel, dtype=data.qvel.dtype).reshape((3,))
+        qvel = data.qvel.at[:3].add(wind_accel * jp.asarray(self.sim_dt, dtype=data.qvel.dtype))
+        data = data.replace(qvel=qvel)
+        return mjx.forward(self.mjx_model, data)
+
+    def _physics_step(self, data: mjx.Data, motor_cmd: jax.Array, wind_accel: jax.Array) -> mjx.Data:
         ctrl = jp.asarray(motor_cmd, dtype=data.ctrl.dtype)
-        return mjx_env.step(self.mjx_model, data, ctrl, 1)
+        data = mjx_env.step(self.mjx_model, data, ctrl, 1)
+        return self._apply_wind(data, wind_accel)
 
     def _extract_body_state(
         self,
@@ -1466,7 +1505,7 @@ class newDrone(mjx_env.MjxEnv):
             )
             motor_cmd = ((1.0 - hover_thrust_blend) * motor_cmd) + (hover_thrust_blend * self.hover_ctrl)
             motor_cmd = jp.clip(motor_cmd, self.motor_low, self.motor_high)
-            step_data = self._physics_step(step_data, motor_cmd)
+            step_data = self._physics_step(step_data, motor_cmd, info["wind_accel"])
             (
                 agent_location,
                 agent_vel,
@@ -1747,6 +1786,7 @@ class newDrone(mjx_env.MjxEnv):
             "terminated": to_f32(terminated_i),
             "truncated": to_f32(truncated_i),
             "reward": to_f32(reward),
+            "wind_accel_norm": to_f32(_safe_l2_norm(info["wind_accel"])),
         }
 
         info = {
@@ -1801,6 +1841,7 @@ class newDrone(mjx_env.MjxEnv):
             "terminated": terminated_i,
             "truncated": truncated_i,
             "reward": metrics["reward"],
+            "wind_accel_norm": metrics["wind_accel_norm"],
         }
         done = to_f32(terminated | truncated)
         return metrics["reward"], done, metrics, info
