@@ -31,9 +31,9 @@
             must learn both target-seeking and local obstacle avoidance.
           </p>
           <p>
-            The final experiments compare on-policy PPO, off-policy SAC, and two PPO-based modifications. The first
-            modification strengthens goal arrival and stabilization behavior, while the second trains with wind
-            disturbances to test robustness under external forces.
+            The final experiments compare on-policy PPO, off-policy SAC, Model-based RL, and two PPO-based
+            modifications. The first modification strengthens goal arrival and stabilization behavior, while the
+            second trains with wind disturbances to test robustness under external forces.
           </p>
           <ul>
             <li>Simulator: MuJoCo</li>
@@ -89,6 +89,14 @@
               Your browser does not support embedded video.
             </video>
             <p class="muted">Off-policy SAC rollout from the tuned checkpoint.</p>
+          </article>
+          <article class="card video-card">
+            <h3>Model-based RL</h3>
+            <video controls preload="metadata" aria-label="Model-based RL Policy Video">
+              <source src="final%20vids/Model%20Based%20RL.mp4" type="video/mp4">
+              Your browser does not support embedded video.
+            </video>
+            <p class="muted">Model-based planning rollout replayed from the saved MBRL evaluation frames.</p>
           </article>
           <article class="card video-card">
             <h3>PPO Modification 1</h3>
