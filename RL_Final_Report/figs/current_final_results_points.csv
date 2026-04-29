@@ -98,53 +98,53 @@ Mod 2: wind PPO,17039360.0,157.23716735839844,actual_eval
 Mod 2: wind PPO,18350080.0,167.54803466796875,actual_eval
 Mod 2: wind PPO,19660800.0,127.98294067382812,actual_eval
 Mod 2: wind PPO,20971520.0,217.7064208984375,actual_eval
-Model-based RL (PETS/MPC estimate),40000.0,-0.057180654257535934,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),80000.0,-0.1390337198972702,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),120000.0,-0.39869827032089233,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),160000.0,-0.656326949596405,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),200000.0,-1.0285453796386719,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),240000.0,-1.4069318771362305,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),280000.0,-1.8691149950027466,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),320000.0,-2.2261834144592285,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),360000.0,-2.465388774871826,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),400000.0,-2.6212258338928223,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),440000.0,-2.830261707305908,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),480000.0,-3.0918209552764893,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),520000.0,-3.34688401222229,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),560000.0,-3.5842857360839844,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),600000.0,-3.9003889560699463,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),640000.0,-4.212281227111816,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),680000.0,-4.536074161529541,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),720000.0,-4.868565559387207,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),760000.0,-5.2552032470703125,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),800000.0,-5.623566627502441,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),840000.0,-6.004148483276367,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),880000.0,-6.385685920715332,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),920000.0,-6.75410270690918,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),960000.0,-7.120971202850342,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1000000.0,-7.474357604980469,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1040000.0,-7.850276947021484,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1080000.0,-8.175143241882324,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1120000.0,-8.49521541595459,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1160000.0,-8.869709968566895,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1200000.0,-9.286843299865723,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1240000.0,-9.650971412658691,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1280000.0,-10.029792785644531,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1320000.0,-10.423395156860352,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1360000.0,-10.82491397857666,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1400000.0,-11.238542556762695,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1440000.0,-11.657964706420898,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1480000.0,-12.094697952270508,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1520000.0,-12.53481388092041,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1560000.0,-13.00467586517334,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1600000.0,-13.479351997375488,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1640000.0,-13.967297554016113,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1680000.0,-14.451183319091797,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1720000.0,-14.900912284851074,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1760000.0,-15.351415634155273,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1800000.0,-15.80172348022461,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1840000.0,-16.289291381835938,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1880000.0,-16.778888702392578,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1920000.0,-17.249170303344727,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),1960000.0,-17.74724769592285,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),2000000.0,-76.54196166992188,estimated_scaled_episode_curve
+Model-based RL,40000.0,-0.057180654257535934,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,80000.0,-0.1390337198972702,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,120000.0,-0.39869827032089233,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,160000.0,-0.656326949596405,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,200000.0,-1.0285453796386719,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,240000.0,-1.4069318771362305,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,280000.0,-1.8691149950027466,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,320000.0,-2.2261834144592285,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,360000.0,-2.465388774871826,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,400000.0,-2.6212258338928223,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,440000.0,-2.830261707305908,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,480000.0,-3.0918209552764893,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,520000.0,-3.34688401222229,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,560000.0,-3.5842857360839844,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,600000.0,-3.9003889560699463,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,640000.0,-4.212281227111816,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,680000.0,-4.536074161529541,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,720000.0,-4.868565559387207,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,760000.0,-5.2552032470703125,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,800000.0,-5.623566627502441,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,840000.0,-6.004148483276367,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,880000.0,-6.385685920715332,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,920000.0,-6.75410270690918,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,960000.0,-7.120971202850342,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1000000.0,-7.474357604980469,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1040000.0,-7.850276947021484,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1080000.0,-8.175143241882324,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1120000.0,-8.49521541595459,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1160000.0,-8.869709968566895,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1200000.0,-9.286843299865723,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1240000.0,-9.650971412658691,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1280000.0,-10.029792785644531,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1320000.0,-10.423395156860352,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1360000.0,-10.82491397857666,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1400000.0,-11.238542556762695,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1440000.0,-11.657964706420898,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1480000.0,-12.094697952270508,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1520000.0,-12.53481388092041,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1560000.0,-13.00467586517334,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1600000.0,-13.479351997375488,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1640000.0,-13.967297554016113,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1680000.0,-14.451183319091797,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1720000.0,-14.900912284851074,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1760000.0,-15.351415634155273,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1800000.0,-15.80172348022461,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1840000.0,-16.289291381835938,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1880000.0,-16.778888702392578,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1920000.0,-17.249170303344727,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,1960000.0,-17.74724769592285,model_based_episode_return_curve_scaled_to_2m_steps
+Model-based RL,2000000.0,-76.54196166992188,model_based_episode_return_curve_scaled_to_2m_steps
