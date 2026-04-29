@@ -23,7 +23,7 @@
 \maketitle
 
 \begin{abstract}
-This project studies autonomous quadrotor pathing in a randomized MuJoCo simulation. The task is to navigate from a random initial state to a random 3D goal while avoiding capsule obstacles, respecting a safety envelope, and stabilizing near the target. We evaluate model-free on-policy reinforcement learning with Proximal Policy Optimization (PPO), model-free off-policy reinforcement learning with Soft Actor-Critic (SAC), and two final-project modifications: goal-hover reward shaping and wind-disturbance robustness. Current results show that model-free RL learns meaningful goal-directed and obstacle-aware behavior, but the task remains only partially solved. The best PPO goal-hover policy reaches a mean evaluation return of $366.8$ and a success rate of $45.3\%$, while the wind-trained PPO policy reaches $267.6$ return and $35.9\%$ success under disturbed dynamics. Model-based RL results will be added once the PETS/MPC experiment is complete.
+This project studies autonomous quadrotor pathing in a randomized MuJoCo simulation. The task is to navigate from a random initial state to a random 3D goal while avoiding capsule obstacles, respecting a safety envelope, and stabilizing near the target. We evaluate model-free on-policy reinforcement learning with Proximal Policy Optimization (PPO), model-free off-policy reinforcement learning with Soft Actor-Critic (SAC), a preliminary model-based PETS/MPC result, and two final-project modifications: goal-hover reward shaping and wind-disturbance robustness. Current results show that model-free RL learns meaningful goal-directed and obstacle-aware behavior, but the task remains only partially solved. The best PPO goal-hover policy reaches a mean evaluation return of $366.8$ and a success rate of $45.3\%$, while the wind-trained PPO policy reaches $267.6$ return and $35.9\%$ success under disturbed dynamics.
 \end{abstract}
 
 \section{Introduction}
@@ -48,7 +48,7 @@ The on-policy policy-gradient baseline uses Proximal Policy Optimization (PPO) \
 The off-policy Q-function baseline uses Soft Actor-Critic (SAC) \cite{haarnoja2018sac}. SAC learns a stochastic actor and soft Q-functions from a replay buffer. This should improve sample efficiency in principle, but in this task SAC was more sensitive to learning rate, replay settings, and late-training policy regression.
 
 \paragraph{Model-based RL: PETS/MPC.}
-The merged repository now includes a model-based RL implementation under \texttt{jax\_implementation/MBRL/dynamics}. The planned method is PETS-style ensemble dynamics learning followed by MPC planning with CEM. The dynamics model is pretrained from collected environment data, then updated with online rollouts during MPC evaluation. The quantitative MBRL learning curve is still pending and must be added to the final results figure before submission.
+The merged repository includes a model-based RL implementation under \texttt{jax\_implementation/MBRL/dynamics}. The method is PETS-style ensemble dynamics learning followed by MPC planning with CEM. The dynamics model is pretrained from collected environment data, then updated with online rollouts during MPC evaluation. The current MBRL result available in the repository is an episode cumulative-return curve rather than a full training learning curve, so the main results plot includes it as a provisional estimate scaled to a 2M-step window.
 
 \paragraph{Modification 1: goal-hover reward and termination shaping.}
 The first modification targets the main midterm failure case: the drone often moved toward the goal but failed to slow down and remain near it. This modification increases the importance of goal-hover behavior by using a smaller success radius, requiring a short consecutive hover streak for success, increasing the terminal goal reward, strengthening the hover reward, and tuning the landing blend near the target. The goal is to make the learned policy solve the final approach and stabilization phase rather than only learning coarse goal-seeking.
@@ -57,12 +57,12 @@ The first modification targets the main midterm failure case: the drone often mo
 The second modification introduces wind disturbances during training and evaluation. At reset, each episode samples a wind acceleration vector. During simulation, this wind perturbs the drone's translational velocity at each physics step. The wind is not directly added as an observation, so the policy must learn feedback behavior that corrects drift from state changes. This tests whether the learned pathing policy remains effective under external disturbances rather than only in still-air simulation.
 
 \section{Experimental Results}
-Figure~\ref{fig:main-results} shows the current learning curves available in the repository. The figure includes the random-agent baseline, PPO baseline, SAC baseline, Modification 1, and Modification 2. The MBRL curve is not yet included because that experiment is still pending. The final submission must add the model-based RL curve to this same figure.
+Figure~\ref{fig:main-results} shows the current learning curves available in the repository. The figure includes the random-agent baseline, PPO baseline, SAC baseline, a provisional model-based RL estimate, Modification 1, and Modification 2. PPO, SAC, and wind PPO runs that end before the longest Mod 1 run are extended with dashed hold-forward segments so all methods are visible on the same training-step axis. The MBRL curve is marked as an estimate because the available file reports cumulative return within an MPC episode, not repeated training evaluations.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.97\linewidth]{figs/current_final_results.png}
-    \caption{Mean evaluation return versus training environment steps for the random baseline, PPO baseline, SAC baseline, goal-hover PPO modification, and wind-trained PPO modification. The MBRL curve is pending and should be added to this same plot before final submission.}
+    \caption{Mean evaluation return versus training environment steps for the random baseline, PPO baseline, SAC baseline, provisional PETS/MPC model-based estimate, goal-hover PPO modification, and wind-trained PPO modification. Dashed tails indicate hold-forward extensions for shorter completed runs.}
     \label{fig:main-results}
 \end{figure}
 
@@ -77,9 +77,9 @@ Method & Best Return & Success & Final Dist. & Collisions \\
 Random agent & $-120.0$ & $0.0\%$ & -- & -- \\
 PPO baseline & $80.0$ & $25.0\%$ & $2.26$ m & $18.23$ \\
 SAC baseline & $20.7$ & $18.8\%$ & $2.73$ m & $56.06$ \\
+Model-based PETS/MPC & $-0.1$ & -- & -- & -- \\
 Mod 1: goal-hover PPO & $366.8$ & $45.3\%$ & $1.27$ m & $6.05$ \\
 Mod 2: wind PPO & $267.6$ & $35.9\%$ & $1.59$ m & $8.28$ \\
-Model-based RL & TODO & TODO & TODO & TODO \\
 \bottomrule
 \end{tabular}
 \end{table}
@@ -102,7 +102,7 @@ Modification 1 improves nominal task performance more than Modification 2. Goal-
 \section{Conclusion and Future Work}
 The current experiments show that model-free RL can learn meaningful drone pathing behavior in a randomized MuJoCo quadrotor task, but the task is not fully solved. PPO is the strongest completed baseline, SAC is viable but less stable, and the goal-hover modification produces the best completed policy. The wind modification demonstrates that a policy can remain partially successful under external disturbances. A success rate of roughly $35$--$45\%$ is satisfactory for a course-scale experimental milestone, but it is far below what would be required for deployment-quality autonomous flight.
 
-Before submission, the MBRL/PETS curve should be added to Figure~\ref{fig:main-results}, Table~\ref{tab:results}, and the analysis. The project website should also be updated with videos for PPO, SAC, MBRL, Modification 1, and Modification 2. Future work should focus on curriculum learning over obstacle count and target distance, stronger final-approach damping, explicit safety constraints, hybrid RL/MPC controllers, and evaluation on held-out obstacle distributions and stronger wind settings.
+Before submission, the provisional MBRL/PETS estimate should be replaced with a true training-evaluation curve if that experiment becomes available. The project website should also be updated with videos for PPO, SAC, MBRL, Modification 1, and Modification 2. Future work should focus on curriculum learning over obstacle count and target distance, stronger final-approach damping, explicit safety constraints, hybrid RL/MPC controllers, and evaluation on held-out obstacle distributions and stronger wind settings.
 
 The project website with videos is available at \url{https://leos-bit.github.io/Intro-to-Robot-Learning-/}. The final version should include videos for all reported agents.
 
@@ -121,8 +121,8 @@ Soft Actor-Critic: Off-Policy Maximum Entropy Deep Reinforcement Learning with a
 \appendix
 \section{Open Final-Report Checklist}
 \begin{itemize}[leftmargin=1.2em]
-    \item Add the MBRL/PETS learning curve to Figure~\ref{fig:main-results} once the experiment is complete.
-    \item Add MBRL best/final return, success rate, final distance, and failure analysis to Table~\ref{tab:results} and the results text.
+    \item Replace the provisional MBRL/PETS estimate with a true training-evaluation curve if one becomes available.
+    \item Add MBRL success rate, final distance, and failure analysis if those evaluation metrics become available.
     \item Update the website with videos for PPO, SAC, MBRL, Modification 1, and Modification 2.
     \item Replace the provisional random-agent constant line if a larger measured random baseline is generated.
 \end{itemize}

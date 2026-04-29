@@ -1,0 +1,154 @@
+run,step,mean_return,point_type
+Random agent,0,-120.0,constant_baseline
+Random agent,64225280.0,-120.0,constant_baseline
+PPO baseline,0.0,-20.845882415771484,actual_eval
+PPO baseline,1310720.0,-28.087881088256836,actual_eval
+PPO baseline,2621440.0,17.101165771484375,actual_eval
+PPO baseline,3932160.0,66.73191833496094,actual_eval
+PPO baseline,5242880.0,5.467402458190918,actual_eval
+PPO baseline,6553600.0,33.26328659057617,actual_eval
+PPO baseline,7864320.0,34.173439025878906,actual_eval
+PPO baseline,9175040.0,21.026012420654297,actual_eval
+PPO baseline,10485760.0,-1.8513356447219849,actual_eval
+PPO baseline,11796480.0,24.273773193359375,actual_eval
+PPO baseline,13107200.0,19.167388916015625,actual_eval
+PPO baseline,14417920.0,33.7296142578125,actual_eval
+PPO baseline,15728640.0,44.77019500732422,actual_eval
+PPO baseline,17039360.0,60.765716552734375,actual_eval
+PPO baseline,18350080.0,-15.968799591064453,actual_eval
+PPO baseline,19660800.0,52.5068359375,actual_eval
+PPO baseline,20971520.0,19.224149703979492,actual_eval
+PPO baseline,22282240.0,12.912969589233398,actual_eval
+PPO baseline,23592960.0,79.98713684082031,actual_eval
+PPO baseline,24903680.0,30.238170623779297,actual_eval
+PPO baseline,64225280.0,30.238170623779297,hold_forward_extension
+SAC baseline,0.0,-113.96656799316406,actual_eval
+SAC baseline,40704.0,-96.90455627441406,actual_eval
+SAC baseline,73216.0,-10.707576751708984,actual_eval
+SAC baseline,105728.0,-32.51156234741211,actual_eval
+SAC baseline,138240.0,20.698627471923828,actual_eval
+SAC baseline,170752.0,-18.299354553222656,actual_eval
+SAC baseline,203264.0,-71.88033294677734,actual_eval
+SAC baseline,235776.0,-62.370094299316406,actual_eval
+SAC baseline,268288.0,10.08372688293457,actual_eval
+SAC baseline,300800.0,-79.64237213134766,actual_eval
+SAC baseline,64225280.0,-79.64237213134766,hold_forward_extension
+Mod 1: goal-hover PPO,0.0,109.22679138183594,actual_eval
+Mod 1: goal-hover PPO,1310720.0,98.14635467529297,actual_eval
+Mod 1: goal-hover PPO,2621440.0,159.20834350585938,actual_eval
+Mod 1: goal-hover PPO,3932160.0,188.73582458496094,actual_eval
+Mod 1: goal-hover PPO,5242880.0,223.81198120117188,actual_eval
+Mod 1: goal-hover PPO,6553600.0,231.25828552246094,actual_eval
+Mod 1: goal-hover PPO,7864320.0,224.09861755371094,actual_eval
+Mod 1: goal-hover PPO,9175040.0,181.84095764160156,actual_eval
+Mod 1: goal-hover PPO,10485760.0,145.9867401123047,actual_eval
+Mod 1: goal-hover PPO,11796480.0,143.75958251953125,actual_eval
+Mod 1: goal-hover PPO,13107200.0,145.68228149414062,actual_eval
+Mod 1: goal-hover PPO,14417920.0,219.0496826171875,actual_eval
+Mod 1: goal-hover PPO,15728640.0,271.5291748046875,actual_eval
+Mod 1: goal-hover PPO,17039360.0,190.50802612304688,actual_eval
+Mod 1: goal-hover PPO,18350080.0,133.80776977539062,actual_eval
+Mod 1: goal-hover PPO,19660800.0,171.593994140625,actual_eval
+Mod 1: goal-hover PPO,20971520.0,240.55068969726562,actual_eval
+Mod 1: goal-hover PPO,22282240.0,181.6775360107422,actual_eval
+Mod 1: goal-hover PPO,23592960.0,246.38853454589844,actual_eval
+Mod 1: goal-hover PPO,24903680.0,227.540771484375,actual_eval
+Mod 1: goal-hover PPO,26214400.0,124.37530517578125,actual_eval
+Mod 1: goal-hover PPO,27525120.0,152.03695678710938,actual_eval
+Mod 1: goal-hover PPO,28835840.0,160.9725341796875,actual_eval
+Mod 1: goal-hover PPO,30146560.0,232.96426391601562,actual_eval
+Mod 1: goal-hover PPO,31457280.0,352.25421142578125,actual_eval
+Mod 1: goal-hover PPO,32768000.0,296.665283203125,actual_eval
+Mod 1: goal-hover PPO,34078720.0,229.9676055908203,actual_eval
+Mod 1: goal-hover PPO,35389440.0,231.25291442871094,actual_eval
+Mod 1: goal-hover PPO,36700160.0,253.88827514648438,actual_eval
+Mod 1: goal-hover PPO,38010880.0,240.30712890625,actual_eval
+Mod 1: goal-hover PPO,39321600.0,282.5809326171875,actual_eval
+Mod 1: goal-hover PPO,40632320.0,164.77285766601562,actual_eval
+Mod 1: goal-hover PPO,41943040.0,165.90447998046875,actual_eval
+Mod 1: goal-hover PPO,43253760.0,220.05642700195312,actual_eval
+Mod 1: goal-hover PPO,44564480.0,291.604248046875,actual_eval
+Mod 1: goal-hover PPO,45875200.0,237.06381225585938,actual_eval
+Mod 1: goal-hover PPO,47185920.0,270.65045166015625,actual_eval
+Mod 1: goal-hover PPO,48496640.0,366.8409423828125,actual_eval
+Mod 1: goal-hover PPO,49807360.0,203.82127380371094,actual_eval
+Mod 1: goal-hover PPO,51118080.0,189.7601776123047,actual_eval
+Mod 1: goal-hover PPO,52428800.0,298.37518310546875,actual_eval
+Mod 1: goal-hover PPO,53739520.0,214.29910278320312,actual_eval
+Mod 1: goal-hover PPO,55050240.0,221.6785125732422,actual_eval
+Mod 1: goal-hover PPO,56360960.0,253.2769012451172,actual_eval
+Mod 1: goal-hover PPO,57671680.0,150.5328369140625,actual_eval
+Mod 1: goal-hover PPO,58982400.0,294.29742431640625,actual_eval
+Mod 1: goal-hover PPO,60293120.0,261.8888244628906,actual_eval
+Mod 1: goal-hover PPO,61603840.0,214.0494384765625,actual_eval
+Mod 1: goal-hover PPO,62914560.0,167.1468505859375,actual_eval
+Mod 1: goal-hover PPO,64225280.0,224.94540405273438,actual_eval
+Mod 2: wind PPO,0.0,49.90261459350586,actual_eval
+Mod 2: wind PPO,1310720.0,101.05067443847656,actual_eval
+Mod 2: wind PPO,2621440.0,215.36862182617188,actual_eval
+Mod 2: wind PPO,3932160.0,189.36558532714844,actual_eval
+Mod 2: wind PPO,5242880.0,221.22427368164062,actual_eval
+Mod 2: wind PPO,6553600.0,267.5854187011719,actual_eval
+Mod 2: wind PPO,7864320.0,226.64089965820312,actual_eval
+Mod 2: wind PPO,9175040.0,223.67581176757812,actual_eval
+Mod 2: wind PPO,10485760.0,178.6287384033203,actual_eval
+Mod 2: wind PPO,11796480.0,131.45095825195312,actual_eval
+Mod 2: wind PPO,13107200.0,108.44839477539062,actual_eval
+Mod 2: wind PPO,14417920.0,129.87030029296875,actual_eval
+Mod 2: wind PPO,15728640.0,234.13916015625,actual_eval
+Mod 2: wind PPO,17039360.0,157.23716735839844,actual_eval
+Mod 2: wind PPO,18350080.0,167.54803466796875,actual_eval
+Mod 2: wind PPO,19660800.0,127.98294067382812,actual_eval
+Mod 2: wind PPO,20971520.0,217.7064208984375,actual_eval
+Mod 2: wind PPO,64225280.0,217.7064208984375,hold_forward_extension
+Model-based RL (PETS/MPC estimate),40000.0,-0.057180654257535934,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),80000.0,-0.1390337198972702,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),120000.0,-0.39869827032089233,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),160000.0,-0.656326949596405,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),200000.0,-1.0285453796386719,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),240000.0,-1.4069318771362305,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),280000.0,-1.8691149950027466,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),320000.0,-2.2261834144592285,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),360000.0,-2.465388774871826,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),400000.0,-2.6212258338928223,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),440000.0,-2.830261707305908,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),480000.0,-3.0918209552764893,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),520000.0,-3.34688401222229,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),560000.0,-3.5842857360839844,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),600000.0,-3.9003889560699463,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),640000.0,-4.212281227111816,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),680000.0,-4.536074161529541,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),720000.0,-4.868565559387207,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),760000.0,-5.2552032470703125,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),800000.0,-5.623566627502441,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),840000.0,-6.004148483276367,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),880000.0,-6.385685920715332,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),920000.0,-6.75410270690918,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),960000.0,-7.120971202850342,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1000000.0,-7.474357604980469,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1040000.0,-7.850276947021484,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1080000.0,-8.175143241882324,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1120000.0,-8.49521541595459,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1160000.0,-8.869709968566895,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1200000.0,-9.286843299865723,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1240000.0,-9.650971412658691,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1280000.0,-10.029792785644531,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1320000.0,-10.423395156860352,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1360000.0,-10.82491397857666,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1400000.0,-11.238542556762695,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1440000.0,-11.657964706420898,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1480000.0,-12.094697952270508,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1520000.0,-12.53481388092041,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1560000.0,-13.00467586517334,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1600000.0,-13.479351997375488,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1640000.0,-13.967297554016113,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1680000.0,-14.451183319091797,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1720000.0,-14.900912284851074,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1760000.0,-15.351415634155273,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1800000.0,-15.80172348022461,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1840000.0,-16.289291381835938,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1880000.0,-16.778888702392578,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1920000.0,-17.249170303344727,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),1960000.0,-17.74724769592285,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),2000000.0,-76.54196166992188,estimated_scaled_episode_curve
+Model-based RL (PETS/MPC estimate),64225280.0,-76.54196166992188,hold_forward_extension
