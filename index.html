@@ -14,14 +14,8 @@
       <h1>Drone Pathing using Reinforcement Learning</h1>
       <p class="authors">Leo Shaw and Siddarth Ashok</p>
       <p class="subtitle">
-        Quadrotor navigation with reinforcement learning, experimental training results, and policy rollout videos.
+        Final project results for autonomous quadrotor navigation in randomized 3D MuJoCo environments.
       </p>
-      <nav class="hero-nav" aria-label="Primary">
-        <a href="#overview">Overview</a>
-        <a href="#results">Results</a>
-        <a href="#videos">Agent Videos</a>
-        <a href="#repro">Reproducibility</a>
-      </nav>
     </div>
   </header>
 
@@ -31,23 +25,36 @@
         <article class="card">
           <h2>Project Overview</h2>
           <p>
-            This project studies autonomous drone navigation in cluttered environments using reinforcement learning.
-            The agent must reach a goal while avoiding collisions and controlling effort.
+            This project studies autonomous drone pathing in a cluttered 3D MuJoCo environment. The robot is a
+            Skydio X2-style quadrotor controlled through high-level velocity and yaw-rate commands rather than direct
+            rotor thrust. Each rollout randomizes the start state, target location, and obstacle layout, so the policy
+            must learn both target-seeking and local obstacle avoidance.
+          </p>
+          <p>
+            The final experiments compare on-policy PPO, off-policy SAC, and two PPO-based modifications. The first
+            modification strengthens goal arrival and stabilization behavior, while the second trains with wind
+            disturbances to test robustness under external forces.
           </p>
           <ul>
             <li>Simulator: MuJoCo</li>
             <li>Platform: Skydio X2-style quadrotor</li>
-            <li>Methods: PPO, SAC, and random baseline</li>
-            <li>Evaluation: Return, collisions, success rate</li>
+            <li>Observation: drone state, target vector, and multi-beam lidar</li>
+            <li>Evaluation: mean return, success rate, final distance, collisions, and rollout videos</li>
           </ul>
         </article>
         <article class="card">
-          <h2>Environment Setup</h2>
-          <p>Key assets currently used in this repository:</p>
+          <h2>Environment and Reward</h2>
+          <p>
+            The task rewards progress toward the target and successful arrival, while penalizing collisions, unsafe
+            flight, excessive speed, abrupt actions, and inefficient control. Obstacle-aware terms use lidar and
+            geometric clearance signals so the drone learns to avoid narrow or unsafe paths rather than only flying
+            directly toward the goal.
+          </p>
           <ul>
-            <li><code>mujoco_drone_imp/</code> - MuJoCo environment and training code</li>
-            <li><code>midterm vids/reward_curves.png</code> - PPO/SAC reward comparison</li>
-            <li><code>midterm vids/SAC.mp4</code> and <code>midterm vids/ppo.mp4</code> - policy videos</li>
+            <li>Randomized target positions and obstacle layouts</li>
+            <li>Capsule obstacles distributed across a bounded 3D workspace</li>
+            <li>Low-level proportional controller maps policy commands to rotor thrust</li>
+            <li>Final report assets live in <code>RL_Final_Report/</code></li>
           </ul>
         </article>
       </div>
@@ -57,8 +64,8 @@
       <div class="container">
         <h2>Experimental Results</h2>
         <figure class="card figure-card">
-          <img src="midterm%20vids/reward_curves.png" alt="PPO and SAC reward curves with random baseline">
-          <figcaption>Mean return versus training environment steps for PPO, SAC, and a random-agent baseline.</figcaption>
+          <img src="RL_Final_Report/figs/current_final_results.png" alt="Final reward curves for PPO, SAC, and modifications">
+          <figcaption>Mean return versus training environment steps for the current final-report methods.</figcaption>
         </figure>
       </div>
     </section>
@@ -68,42 +75,37 @@
         <h2>Agent Performance Videos</h2>
         <div class="video-grid">
           <article class="card video-card">
-            <h3>Random Agent Run 1</h3>
-            <video controls preload="metadata" aria-label="Random Agent Run 1">
-              <source src="videos/random_run_01.mp4" type="video/mp4">
+            <h3>PPO Tuned</h3>
+            <video controls preload="metadata" aria-label="PPO Tuned Policy Video">
+              <source src="final%20vids/PPO%20Tuned.mp4" type="video/mp4">
               Your browser does not support embedded video.
             </video>
-            <p class="muted">Expected file: <code>videos/random_run_01.mp4</code></p>
+            <p class="muted">Goal-directed PPO rollout selected from the tuned checkpoint.</p>
           </article>
           <article class="card video-card">
-            <h3>SAC Policy</h3>
-            <video controls preload="metadata" aria-label="SAC Policy Video">
-              <source src="midterm%20vids/SAC.mp4" type="video/mp4">
+            <h3>SAC Tuned</h3>
+            <video controls preload="metadata" aria-label="SAC Tuned Policy Video">
+              <source src="final%20vids/SAC%20Tuned.mp4" type="video/mp4">
               Your browser does not support embedded video.
             </video>
-            <p class="muted">Expected file: <code>midterm vids/SAC.mp4</code></p>
+            <p class="muted">Off-policy SAC rollout from the tuned checkpoint.</p>
           </article>
           <article class="card video-card">
-            <h3>PPO Policy</h3>
-            <video controls preload="metadata" aria-label="PPO Policy Video">
-              <source src="midterm%20vids/ppo.mp4" type="video/mp4">
+            <h3>PPO Modification 1</h3>
+            <video controls preload="metadata" aria-label="PPO Modification 1 Video">
+              <source src="final%20vids/PPO%20Mod%201.mp4" type="video/mp4">
               Your browser does not support embedded video.
             </video>
-            <p class="muted">Expected file: <code>midterm vids/ppo.mp4</code></p>
+            <p class="muted">Goal-hover / stabilization modification rollout.</p>
           </article>
-        </div>
-      </div>
-    </section>
-
-    <section id="repro" class="section alt">
-      <div class="container">
-        <h2>Reproducibility</h2>
-        <div class="card">
-          <p>Minimal startup flow for the MuJoCo reinforcement-learning setup:</p>
-          <pre><code>cd mujoco_drone_imp
-$env:PYTHONPATH = (Get-Location).Path
-python -m drone_training.src.training.train_ppo
-python -m drone_training.src.training.train_sac</code></pre>
+          <article class="card video-card">
+            <h3>PPO Modification 2</h3>
+            <video controls preload="metadata" aria-label="PPO Modification 2 Wind Video">
+              <source src="final%20vids/PPO%20Mod%202.mp4" type="video/mp4">
+              Your browser does not support embedded video.
+            </video>
+            <p class="muted">Wind-disturbance robustness modification rollout.</p>
+          </article>
         </div>
       </div>
     </section>
