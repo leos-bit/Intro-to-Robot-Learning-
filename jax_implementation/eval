@@ -1,4 +1,5 @@
 import functools
+import argparse
 import json
 import runpy
 from pathlib import Path
@@ -15,6 +16,11 @@ _REPO_ROOT = _THIS_FILE.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 from jax_implementation.env import newDrone, default_config
+try:
+    from jax_implementation.env import sync_config_gain_arr
+except ImportError:
+    def sync_config_gain_arr(cfg):
+        return cfg
 import mujoco
 import mujoco.viewer
 from mujoco_playground._src import mjx_env
@@ -61,7 +67,7 @@ def _load_env_cfg_from_checkpoint(ckpt: Path):
                 f"{env_cfg.action_repeat} vs {ppo_action_repeat}"
             )
 
-    return env_cfg
+    return sync_config_gain_arr(env_cfg)
 
 
 def load_policy(ckpt: Path):
@@ -115,6 +121,16 @@ def load_policy(ckpt: Path):
 
     return policy, env, params
 
+
+def make_default_eval_env():
+    ns = runpy.run_path(
+        str(_REPO_ROOT / "jax_implementation/ppo/ppo_train"),
+        run_name="ppo_train_test",
+    )
+    StateObsWrapper = ns["StateObsWrapper"]
+    env_cfg = sync_config_gain_arr(default_config())
+    return StateObsWrapper(newDrone(config=env_cfg))
+
 def _sync_viewer_data(env: newDrone, viewer_data: mujoco.MjData, state: mjx_env.State) -> None:
     viewer_data.qpos[:] = np.asarray(state.data.qpos)
     viewer_data.qvel[:] = np.asarray(state.data.qvel)
@@ -141,6 +157,26 @@ def _set_overview_camera(env: newDrone, viewer) -> None:
     viewer.cam.elevation = -30.0
 
 
+def _draw_target_marker(viewer, state: mjx_env.State, radius: float = 0.18) -> None:
+    """Draws a viewer-only target marker that physics and lidar cannot see."""
+    if viewer is None or not hasattr(viewer, "user_scn"):
+        return
+    user_scn = viewer.user_scn
+    if user_scn.ngeom >= len(user_scn.geoms):
+        return
+    target = np.asarray(state.info["target"], dtype=np.float64).reshape(3)
+    geom = user_scn.geoms[user_scn.ngeom]
+    mujoco.mjv_initGeom(
+        geom,
+        mujoco.mjtGeom.mjGEOM_SPHERE,
+        np.array([radius, 0.0, 0.0], dtype=np.float64),
+        target,
+        np.eye(3, dtype=np.float64).reshape(-1),
+        np.array([0.05, 0.95, 0.15, 0.85], dtype=np.float32),
+    )
+    user_scn.ngeom += 1
+
+
 def run_eval_single(
     policy, 
     env,
@@ -148,6 +184,7 @@ def run_eval_single(
     seed: int = 0,
     render: bool = True,
     jit_step: bool = True,
+    stop_on_done: bool = False,
      
 ) -> None:
     base_env = env.env if hasattr(env, "env") else env
@@ -164,6 +201,8 @@ def run_eval_single(
         _sync_viewer_data(base_env, viewer_data, state)
         viewer = mujoco.viewer.launch_passive(base_env.mj_model, viewer_data)
         _set_overview_camera(base_env, viewer)
+        viewer.user_scn.ngeom = 0
+        _draw_target_marker(viewer, state)
         viewer.sync()
 
 
@@ -176,6 +215,8 @@ def run_eval_single(
 
             if render and viewer is not None:
                 _sync_viewer_data(base_env, viewer_data, state)
+                viewer.user_scn.ngeom = 0
+                _draw_target_marker(viewer, state)
                 viewer.sync()
                 if hasattr(viewer, "is_running") and not viewer.is_running():
                     print("Viewer closed, stopping demo.")
@@ -201,6 +242,8 @@ def run_eval_single(
                     f"oob={bool(state.info['out_of_bounds'])}",
                     f"numerical_issue={bool(state.info['numerical_issue'])}",
                 )
+                if stop_on_done:
+                    break
                 rng, reset_rng = jax.random.split(rng)
                 state = env.reset(reset_rng)
 
@@ -215,6 +258,7 @@ def run_eval_random(
     seed: int = 0,
     render: bool = True,
     jit_step: bool = True,
+    stop_on_done: bool = False,
      
 ) -> None:
     base_env = env.env if hasattr(env, "env") else env
@@ -231,6 +275,8 @@ def run_eval_random(
         _sync_viewer_data(base_env, viewer_data, state)
         viewer = mujoco.viewer.launch_passive(base_env.mj_model, viewer_data)
         _set_overview_camera(base_env, viewer)
+        viewer.user_scn.ngeom = 0
+        _draw_target_marker(viewer, state)
         viewer.sync()
 
 
@@ -243,6 +289,8 @@ def run_eval_random(
 
             if render and viewer is not None:
                 _sync_viewer_data(base_env, viewer_data, state)
+                viewer.user_scn.ngeom = 0
+                _draw_target_marker(viewer, state)
                 viewer.sync()
                 if hasattr(viewer, "is_running") and not viewer.is_running():
                     print("Viewer closed, stopping demo.")
@@ -268,6 +316,8 @@ def run_eval_random(
                     f"oob={bool(state.info['out_of_bounds'])}",
                     f"numerical_issue={bool(state.info['numerical_issue'])}",
                 )
+                if stop_on_done:
+                    break
                 rng, reset_rng = jax.random.split(rng)
                 state = env.reset(reset_rng)
 
@@ -278,11 +328,136 @@ def run_eval_random(
             viewer.close()
 
 
+def rollout_episode(policy, env, seed: int, num_steps: int, agent: str, jit_step: bool = True):
+    rng = jax.random.PRNGKey(seed)
+    rng, reset_rng = jax.random.split(rng)
+    state = env.reset(reset_rng)
+    step_fn = jax.jit(env.step) if jit_step else env.step
+
+    total_reward = 0.0
+    final_step = 0
+    for step in range(num_steps):
+        rng, action_key = jax.random.split(rng)
+        if agent == "random":
+            action = jax.random.uniform(
+                key=action_key,
+                shape=(4, 1),
+                dtype=jp.float32,
+                minval=-1,
+                maxval=1,
+            )
+        else:
+            action, _ = policy(state.obs, action_key)
+        state = step_fn(state, action)
+        total_reward += float(state.reward)
+        final_step = step + 1
+        if bool(state.done):
+            break
+
+    final_distance = float(state.info["distance"])
+    success = bool(state.info["success"])
+    collision = bool(state.info["collision"])
+    out_of_bounds = bool(state.info["out_of_bounds"])
+    hold_streak = int(state.info["goal_hold_streak"])
+    return {
+        "seed": seed,
+        "steps": final_step,
+        "reward": total_reward,
+        "final_distance": final_distance,
+        "success": success,
+        "collision": collision,
+        "out_of_bounds": out_of_bounds,
+        "hold_streak": hold_streak,
+    }
+
+
+def select_best_episode(policy, env, agent: str, base_seed: int, episodes: int, num_steps: int, jit_step: bool = True):
+    results = []
+    for i in range(episodes):
+        seed = base_seed + i
+        result = rollout_episode(policy, env, seed, num_steps, agent=agent, jit_step=jit_step)
+        results.append(result)
+        print(
+            f"candidate {i + 1:02d}/{episodes:02d} seed={seed} "
+            f"success={result['success']} reward={result['reward']:.3f} "
+            f"final_dist={result['final_distance']:.3f} steps={result['steps']} "
+            f"collision={result['collision']} oob={result['out_of_bounds']}"
+        )
+
+    def rank(result):
+        return (
+            int(result["success"]),
+            -int(result["collision"]),
+            -int(result["out_of_bounds"]),
+            -float(result["final_distance"]),
+            float(result["reward"]),
+        )
+
+    best = max(results, key=rank)
+    print(
+        "selected best",
+        f"seed={best['seed']}",
+        f"success={best['success']}",
+        f"reward={best['reward']:.3f}",
+        f"final_dist={best['final_distance']:.3f}",
+        f"steps={best['steps']}",
+    )
+    return best
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Open a live MuJoCo viewer for PPO checkpoints or a random policy.")
+    parser.add_argument("--checkpoint", type=Path, default=None, help="PPO checkpoint directory to load.")
+    parser.add_argument("--agent", choices=("ppo", "random"), default="ppo", help="Policy to visualize.")
+    parser.add_argument("--num_steps", type=int, default=10000)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--render", dest="render", action="store_true", default=True)
+    parser.add_argument("--no-render", dest="render", action="store_false")
+    parser.add_argument("--jit_step", dest="jit_step", action="store_true", default=True)
+    parser.add_argument("--no-jit_step", dest="jit_step", action="store_false")
+    parser.add_argument("--select_best", action="store_true", help="Evaluate several seeds headlessly, then replay the best one.")
+    parser.add_argument("--episodes", type=int, default=20, help="Candidate episodes to scan when --select_best is used.")
+    parser.add_argument("--stop_on_done", action="store_true", help="Stop after the first episode ends instead of resetting.")
+    args = parser.parse_args()
+
+    seed = int(np.random.randint(0, 1_000_000)) if args.seed is None else int(args.seed)
+
+    if args.agent == "random":
+        if args.checkpoint is not None:
+            policy, env, _ = load_policy(args.checkpoint)
+        else:
+            policy = None
+            env = make_default_eval_env()
+        if args.select_best:
+            best = select_best_episode(policy, env, "random", seed, args.episodes, args.num_steps, args.jit_step)
+            seed = best["seed"]
+        run_eval_random(
+            env,
+            num_steps=args.num_steps,
+            seed=seed,
+            render=args.render,
+            jit_step=args.jit_step,
+            stop_on_done=args.stop_on_done or args.select_best,
+        )
+        return
+
+    if args.checkpoint is None:
+        raise SystemExit("--checkpoint is required when --agent ppo")
+
+    model, env, _ = load_policy(args.checkpoint)
+    if args.select_best:
+        best = select_best_episode(model, env, "ppo", seed, args.episodes, args.num_steps, args.jit_step)
+        seed = best["seed"]
+    run_eval_single(
+        model,
+        env,
+        args.num_steps,
+        seed,
+        args.render,
+        args.jit_step,
+        stop_on_done=args.stop_on_done or args.select_best,
+    )
+
+
 if __name__ == "__main__":
-    model, env, params = load_policy("drone_training/latest_ppo/playground_ppo/DroneMJX-20260324-182737/checkpoints/000062259200")
-   
-    seed = int(np.random.randint(0, 1_000_000))
-    # run_eval_single(model, env, 10000,seed, True, True)
-    
-    
-    run_eval_random(env, num_steps=2000, seed=seed, render=True, jit_step=True)
+    main()
