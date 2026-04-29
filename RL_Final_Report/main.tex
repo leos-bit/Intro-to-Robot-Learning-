@@ -57,12 +57,12 @@ The first modification targets the main midterm failure case: the drone often mo
 The second modification introduces wind disturbances during training and evaluation. At reset, each episode samples a wind acceleration vector. During simulation, this wind perturbs the drone's translational velocity at each physics step. The wind is not directly added as an observation, so the policy must learn feedback behavior that corrects drift from state changes. This tests whether the learned pathing policy remains effective under external disturbances rather than only in still-air simulation.
 
 \section{Experimental Results}
-Figure~\ref{fig:main-results} shows the current learning curves available in the repository. The figure includes the random-agent baseline, PPO baseline, SAC baseline, a provisional model-based RL estimate, Modification 1, and Modification 2. PPO, SAC, and wind PPO runs that end before the longest Mod 1 run are extended with dashed hold-forward segments so all methods are visible on the same training-step axis. The MBRL curve is marked as an estimate because the available file reports cumulative return within an MPC episode, not repeated training evaluations.
+Figure~\ref{fig:main-results} shows the current learning curves available in the repository. The figure includes the random-agent baseline, PPO baseline, SAC baseline, a provisional model-based RL estimate, Modification 1, and Modification 2. Each PPO/SAC curve uses only saved evaluation points from its corresponding training run. The MBRL curve is marked as an estimate because the available file reports cumulative return within an MPC episode, not repeated training evaluations.
 
 \begin{figure}[H]
     \centering
     \includegraphics[width=0.97\linewidth]{figs/current_final_results.png}
-    \caption{Mean evaluation return versus training environment steps for the random baseline, PPO baseline, SAC baseline, provisional PETS/MPC model-based estimate, goal-hover PPO modification, and wind-trained PPO modification. Dashed tails indicate hold-forward extensions for shorter completed runs.}
+    \caption{Mean evaluation return versus training environment steps for the random baseline, PPO baseline, SAC baseline, provisional PETS/MPC model-based estimate, goal-hover PPO modification, and wind-trained PPO modification.}
     \label{fig:main-results}
 \end{figure}
 

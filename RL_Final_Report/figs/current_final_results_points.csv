@@ -21,7 +21,6 @@ PPO baseline,20971520.0,19.224149703979492,actual_eval
 PPO baseline,22282240.0,12.912969589233398,actual_eval
 PPO baseline,23592960.0,79.98713684082031,actual_eval
 PPO baseline,24903680.0,30.238170623779297,actual_eval
-PPO baseline,64225280.0,30.238170623779297,hold_forward_extension
 SAC baseline,0.0,-113.96656799316406,actual_eval
 SAC baseline,40704.0,-96.90455627441406,actual_eval
 SAC baseline,73216.0,-10.707576751708984,actual_eval
@@ -32,7 +31,6 @@ SAC baseline,203264.0,-71.88033294677734,actual_eval
 SAC baseline,235776.0,-62.370094299316406,actual_eval
 SAC baseline,268288.0,10.08372688293457,actual_eval
 SAC baseline,300800.0,-79.64237213134766,actual_eval
-SAC baseline,64225280.0,-79.64237213134766,hold_forward_extension
 Mod 1: goal-hover PPO,0.0,109.22679138183594,actual_eval
 Mod 1: goal-hover PPO,1310720.0,98.14635467529297,actual_eval
 Mod 1: goal-hover PPO,2621440.0,159.20834350585938,actual_eval
@@ -100,7 +98,6 @@ Mod 2: wind PPO,17039360.0,157.23716735839844,actual_eval
 Mod 2: wind PPO,18350080.0,167.54803466796875,actual_eval
 Mod 2: wind PPO,19660800.0,127.98294067382812,actual_eval
 Mod 2: wind PPO,20971520.0,217.7064208984375,actual_eval
-Mod 2: wind PPO,64225280.0,217.7064208984375,hold_forward_extension
 Model-based RL (PETS/MPC estimate),40000.0,-0.057180654257535934,estimated_scaled_episode_curve
 Model-based RL (PETS/MPC estimate),80000.0,-0.1390337198972702,estimated_scaled_episode_curve
 Model-based RL (PETS/MPC estimate),120000.0,-0.39869827032089233,estimated_scaled_episode_curve
@@ -151,4 +148,3 @@ Model-based RL (PETS/MPC estimate),1880000.0,-16.778888702392578,estimated_scale
 Model-based RL (PETS/MPC estimate),1920000.0,-17.249170303344727,estimated_scaled_episode_curve
 Model-based RL (PETS/MPC estimate),1960000.0,-17.74724769592285,estimated_scaled_episode_curve
 Model-based RL (PETS/MPC estimate),2000000.0,-76.54196166992188,estimated_scaled_episode_curve
-Model-based RL (PETS/MPC estimate),64225280.0,-76.54196166992188,hold_forward_extension
